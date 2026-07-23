@@ -134,18 +134,17 @@ export async function runHttpTests() {
     assert.deepEqual(body.ids, ["mem_1"]);
   }
 
-  // 5) Second silent bug: a 200 with {success:false, deleted_count:0} (nothing
-  //    matched) must surface as an error, not be swallowed as a success.
+  // 5) Second silent bug, reconciled per id: a no-op response (nothing matched)
+  //    confirms zero deletions, so the id is reported failed (retain + retry),
+  //    never swallowed as success.
   {
     const client = new HydraClient({
       ...SCOPE,
       fetch: capturingFetch([], () => ({ data: { deleted_count: 0 }, success: false }))
     });
-    await assert.rejects(
-      () => client.deleteKnowledge(["missing"]),
-      /deleted nothing/,
-      "a zero-match delete must reject instead of silently succeeding"
-    );
+    const res = await client.deleteKnowledge(["missing"]);
+    assert.deepEqual(res.deletedIds, [], "a zero-match delete confirms no deletions");
+    assert.deepEqual(res.failedIds, ["missing"], "the unmatched id must be reported failed for retry");
   }
 
   // 6) Recall round-trip: the SDK deserializes the v2 wire response to
@@ -169,10 +168,11 @@ export async function runHttpTests() {
     assert.equal(recall.chunks[0].sourceId, "s1");
   }
 
-  // 7) camelCase delete no-op detection. The SDK deserializes the delete
-  //    envelope to camelCase (deletedCount / userMemoryDeleted); a snake_case-only
-  //    check would MISS the zero-match no-op and silently "succeed". Inject a spy
-  //    SDK returning the exact camelCase shapes the real SDK produces.
+  // 7) Per-id delete classification matrix. The wrapper returns exactly which
+  //    requested ids the server confirmed deleted vs. failed, derived from the
+  //    SDK's camelCase response. ONE design subsumes every axis Greptile walked:
+  //    success flag, integer counts (0 = none), per-item results incl. MIXED,
+  //    empty results, and missing fields.
   {
     const wrap = (envelope) =>
       createHydraWrapper({
@@ -181,64 +181,74 @@ export async function runHttpTests() {
         subTenantId: "col_test",
         sdkClient: { context: { delete: async () => envelope } }
       });
-    await assert.rejects(
-      () => wrap({ success: true, data: { deletedCount: 0 } }).context.delete({ ids: ["x"], kind: "knowledge" }),
-      /deleted nothing/,
-      "camelCase deletedCount:0 must surface as a no-op failure"
-    );
-    await assert.rejects(
-      () => wrap({ success: true, data: { userMemoryDeleted: false } }).context.delete({ ids: ["m"], kind: "memory" }),
-      /deleted nothing/,
-      "camelCase userMemoryDeleted:false must surface as a no-op failure"
-    );
-    await assert.rejects(
-      () => wrap({ success: true, data: { userMemoryDeleted: 0 } }).context.delete({ ids: ["m"], kind: "memory" }),
-      /deleted nothing/,
-      "NUMERIC userMemoryDeleted:0 must surface as a no-op failure (not just boolean false)"
-    );
-    // Per-item results: all items failed (deleted:false) is a no-op failure.
-    await assert.rejects(
-      () =>
-        wrap({ success: true, data: { results: [{ id: "a", deleted: false, error: "not found" }] } })
-          .context.delete({ ids: ["a"], kind: "knowledge" }),
-      /deleted nothing/,
-      "results[] with every item deleted:false must surface as a no-op failure"
-    );
-    // Genuine deletions must NOT throw (numeric truthy count, boolean true, or a
-    // results item that actually deleted).
-    await wrap({ success: true, data: { deletedCount: 2 } }).context.delete({ ids: ["a", "b"], kind: "knowledge" });
-    await wrap({ success: true, data: { userMemoryDeleted: 1 } }).context.delete({ ids: ["m"], kind: "memory" });
-    await wrap({ success: true, data: { results: [{ id: "a", deleted: true }] } }).context.delete({ ids: ["a"], kind: "knowledge" });
+    const cases = [
+      ["all via count", { success: true, data: { deletedCount: 2 } }, ["a", "b"], ["a", "b"], []],
+      ["none via count 0", { success: true, data: { deletedCount: 0 } }, ["a"], [], ["a"]],
+      ["none via success:false", { success: false, data: { deletedCount: 2 } }, ["a"], [], ["a"]],
+      ["numeric userMemoryDeleted:0", { success: true, data: { userMemoryDeleted: 0 } }, ["m"], [], ["m"]],
+      ["numeric userMemoryDeleted:1", { success: true, data: { userMemoryDeleted: 1 } }, ["m"], ["m"], []],
+      [
+        "MIXED results (partial batch)",
+        { success: true, data: { results: [{ id: "a", deleted: true }, { id: "b", deleted: false, error: "x" }] } },
+        ["a", "b"],
+        ["a"],
+        ["b"]
+      ],
+      ["empty results", { success: true, data: { results: [] } }, ["a"], [], ["a"]],
+      [
+        "all results true",
+        { success: true, data: { results: [{ id: "a", deleted: true }, { id: "b", deleted: true }] } },
+        ["a", "b"],
+        ["a", "b"],
+        []
+      ],
+      ["minimal success (no counts/results)", { success: true, data: {} }, ["a"], ["a"], []]
+    ];
+    for (const [label, envelope, ids, expDeleted, expFailed] of cases) {
+      const res = await wrap(envelope).context.delete({ ids, kind: "knowledge" });
+      assert.deepEqual(res.deletedIds, expDeleted, `deletedIds for "${label}"`);
+      assert.deepEqual(res.failedIds, expFailed, `failedIds for "${label}"`);
+    }
   }
 
-  // 8) End-to-end: a failed workspace delete must surface into summary.errors AND
-  //    RETAIN tracked state (so the next sync retries) — never silently drop the
-  //    entry, which is how the second silent bug hid.
+  // 8) End-to-end PER-ID reconciliation. Two tracked knowledge files map to two
+  //    ids; the client confirms only one deleted. workspace-sync must drop
+  //    tracking for the confirmed file, RETAIN it for the unconfirmed one (so the
+  //    next sync retries), and surface the incomplete delete — never
+  //    all-or-nothing, which is how a partial/no-op delete silently lost state.
   {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-del-retain-"));
-    const filePath = path.join(dir, "CLAUDE.md"); // absent on disk → triggers a delete
+    const crypto = await import("node:crypto");
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-del-perid-"));
+    // Source ids exactly as workspace-sync derives them: claude-file:<sha1(root:rel)>.
+    const idFor = (rel) => `claude-file:${crypto.createHash("sha1").update(`${dir}:${rel}`).digest("hex")}`;
+    const [relDrop, relKeep] = ["DROP.md", "KEEP.md"];
+    const pDrop = path.join(dir, relDrop);
+    const pKeep = path.join(dir, relKeep);
     const state = {
       files: {
-        [filePath]: { digest: "d", relPath: "CLAUDE.md", syncedAt: "2026-01-01T00:00:00.000Z", target: "knowledge", chunkCount: 1 }
+        [pDrop]: { digest: "d", relPath: relDrop, syncedAt: "2026-01-01T00:00:00.000Z", target: "knowledge", chunkCount: 1 },
+        [pKeep]: { digest: "d", relPath: relKeep, syncedAt: "2026-01-01T00:00:00.000Z", target: "knowledge", chunkCount: 1 }
       },
       sessions: {},
       lastSessionId: "",
       lastRecall: null
     };
-    const throwingClient = {
+    const mixedClient = {
       tenantId: "db_test",
       subTenantId: "col_test",
       addMemories: async () => {},
       uploadKnowledge: async () => {},
-      deleteMemories: async () => {},
-      deleteKnowledge: async () => {
-        throw new Error("/context (delete) deleted nothing for [\"…\"]");
-      }
+      deleteMemories: async () => ({ deletedIds: [], failedIds: [] }),
+      // Confirms only DROP.md; KEEP.md is reported failed.
+      deleteKnowledge: async (ids) => ({
+        deletedIds: [idFor(relDrop)],
+        failedIds: ids.filter((id) => id !== idFor(relDrop))
+      })
     };
     const summary = await syncWorkspace({
-      client: throwingClient,
+      client: mixedClient,
       config: {
-        includeGlobs: ["CLAUDE.md"],
+        includeGlobs: ["*.md"],
         excludeGlobs: [],
         maxFileSizeBytes: 50 * 1024 * 1024,
         maxFilesPerSync: 25,
@@ -253,11 +263,10 @@ export async function runHttpTests() {
       workspaceName: "t",
       state
     });
-    assert.ok(
-      summary.errors.some((e) => /knowledge delete failed/.test(e)),
-      "a failed delete must surface into summary.errors"
-    );
-    assert.ok(state.files[filePath], "tracked state must be RETAINED after a failed delete, for retry");
+    assert.ok(!state.files[pDrop], "confirmed-deleted file must have tracking dropped");
+    assert.ok(state.files[pKeep], "UNCONFIRMED file must RETAIN tracking for retry");
+    assert.equal(summary.deleted, 1, "only the confirmed delete counts");
+    assert.ok(summary.errors.some((e) => /incomplete/.test(e)), "the unconfirmed delete must be surfaced");
   }
 
   // 9) The single normalization seam: EVERY wrapper method returns snake_cased

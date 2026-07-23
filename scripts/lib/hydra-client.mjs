@@ -499,14 +499,16 @@ export class HydraClient {
     );
   }
 
+  // Returns { deletedIds, failedIds, data }: which ids the server confirmed
+  // deleted vs. which it did not. The caller reconciles per id — dropping tracked
+  // state only for confirmed deletes and retaining the rest for retry — instead
+  // of treating a batched delete as an all-or-nothing success (the second silent
+  // bug, where a no-op/partial delete dropped state for context still stored).
   async deleteMemories(memoryIds, options = {}) {
     const ids = (memoryIds || []).filter(Boolean);
     if (!ids.length) {
-      return { success: true, user_memory_deleted: false };
+      return { deletedIds: [], failedIds: [] };
     }
-    // One batched delete on the canonical path. The wrapper raises on a
-    // {success:false}/user_memory_deleted:false body instead of letting the old
-    // silent 200 be counted as a successful delete (the second silent bug).
     return this._hydra.context.delete(
       { ids, kind: "memory" },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
@@ -515,7 +517,7 @@ export class HydraClient {
 
   async deleteMemory(memoryId, options = {}) {
     if (!memoryId) {
-      return { success: true, user_memory_deleted: false };
+      return { deletedIds: [], failedIds: [] };
     }
     return this.deleteMemories([memoryId], options);
   }
@@ -523,7 +525,7 @@ export class HydraClient {
   async deleteKnowledge(ids, options = {}) {
     const knowledgeIds = (Array.isArray(ids) ? ids : []).filter(Boolean);
     if (!knowledgeIds.length) {
-      return { success: true, deleted_count: 0, results: [] };
+      return { deletedIds: [], failedIds: [] };
     }
     return this._hydra.context.delete(
       { ids: knowledgeIds, kind: "knowledge" },

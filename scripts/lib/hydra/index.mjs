@@ -101,6 +101,55 @@ function isEnvelopeSuccessFalse(value) {
   return Boolean(value && typeof value === "object" && "success" in value && value.success === false);
 }
 
+// Deletion is inherently PER ID: a batched delete can return a mix of deleted
+// and not-deleted items, so a whole-batch success/no-op question is the wrong
+// shape. Given the requested ids and the (seam-normalized) delete response,
+// return exactly which ids the server CONFIRMS were deleted; every other
+// requested id is a failure the caller must retain and retry. Derived from the
+// SDK delete type (HandlerEnvelopeSourcesMemoryDeleteResponse):
+//   envelope.success / data.success  → boolean (false ⇒ nothing deleted)
+//   data.results[].deleted           → per-item boolean, AUTHORITATIVE whenever
+//                                       the array is present (even when empty)
+//   data.deleted_count / user_memory_deleted → integers, mapped all-or-none only
+//                                       when there is no per-item results array
+// Counts are integers (0 = no match), so they are compared with `=== 0` / `>=`,
+// never `=== false`. This one classification subsumes all-success, all-fail,
+// partial/mixed, numeric-zero, per-item-error, and missing-field responses.
+function classifyDeletion(requestedIds, envelope, data) {
+  const all = { deletedIds: [...requestedIds], failedIds: [] };
+  const none = { deletedIds: [], failedIds: [...requestedIds] };
+  if (!requestedIds.length) {
+    return { deletedIds: [], failedIds: [] };
+  }
+  if (isEnvelopeSuccessFalse(envelope) || data.success === false) {
+    return none;
+  }
+  if (Array.isArray(data.results)) {
+    // Per-item reporting is in use; confirm only ids explicitly deleted:true.
+    const confirmed = new Set(
+      data.results.filter((r) => r && r.deleted === true && r.id != null).map((r) => String(r.id))
+    );
+    return {
+      deletedIds: requestedIds.filter((id) => confirmed.has(String(id))),
+      failedIds: requestedIds.filter((id) => !confirmed.has(String(id)))
+    };
+  }
+  // No per-item detail: fall back to the integer counts, all-or-none. A count
+  // that covers every requested id (or the absence of any negative signal on an
+  // otherwise-successful response) confirms all; a zero or partial count that
+  // cannot be attributed to specific ids confirms none (retain + retry).
+  const count =
+    data.deleted_count !== undefined
+      ? Number(data.deleted_count)
+      : data.user_memory_deleted !== undefined
+        ? Number(data.user_memory_deleted)
+        : undefined;
+  if (count === undefined || count >= requestedIds.length) {
+    return all;
+  }
+  return none;
+}
+
 export function createHydraWrapper({
   apiKey,
   tenantId,
@@ -233,11 +282,13 @@ export function createHydraWrapper({
       );
     },
 
-    // One delete path for memory and knowledge. The server answers a zero-match
-    // delete with 200 `{success:false, deleted_count:0}` (and the memory path
-    // with `user_memory_deleted:false`), which the plugin used to swallow as a
-    // successful delete. Inspect the body — never the status code — and raise so
-    // the caller can surface it and retry, for BOTH kinds.
+    // One delete path for memory and knowledge. Deletion is reconciled PER ID:
+    // this returns which requested ids the server confirms were deleted, plus
+    // the ids it did NOT (failed, no-op, per-item error, or unattributable) —
+    // which the caller must retain and retry rather than drop. A batched delete
+    // that partially succeeds no longer resolves as an all-or-nothing success.
+    // Transport/SDK errors still throw (via `call`); only the logical outcome is
+    // returned. Returns { deletedIds, failedIds, data } (data = raw response).
     async delete(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
       const requestedIds = Array.isArray(args.ids) ? args.ids : [];
@@ -249,38 +300,9 @@ export function createHydraWrapper({
       const envelope = await call("/context (delete)", timeoutMs, () =>
         client.context.delete(request, requestOptions(timeoutMs))
       );
-      // `data` is already unwrapped + snake_cased by the seam. The SDK delete
-      // response (HandlerEnvelopeSourcesMemoryDeleteResponse) signals a no-op
-      // across several fields, and — critically — the counts are INTEGERS (0 =
-      // no match), NOT booleans. Enumerated from the SDK type so this can't be
-      // wrong on another axis:
-      //   envelope.success / data.success        → boolean
-      //   data.deleted_count                      → number (sources deleted)
-      //   data.user_memory_deleted                → number (memories deleted)
-      //   data.results[].deleted                  → per-item boolean
-      // Treat the delete as a FAILURE when any PRESENT signal reports that
-      // nothing was deleted — using `=== 0` on the numeric fields, never
-      // `=== false`. Absent fields never trigger a false failure.
       const data = unwrapAndNormalize(envelope) ?? {};
-      const deletedNoSources =
-        requestedIds.length > 0 && data.deleted_count !== undefined && Number(data.deleted_count) === 0;
-      const deletedNoMemory =
-        data.user_memory_deleted !== undefined && Number(data.user_memory_deleted) === 0;
-      const everyResultFailed =
-        Array.isArray(data.results) && data.results.length > 0 && data.results.every((r) => r && r.deleted === false);
-      const failed =
-        isEnvelopeSuccessFalse(envelope) ||
-        data.success === false ||
-        deletedNoSources ||
-        deletedNoMemory ||
-        everyResultFailed;
-      if (failed) {
-        throw new HydraWrapperError(
-          `/context (delete) deleted nothing for ${JSON.stringify(requestedIds)} ` +
-            `(success/deleted_count/user_memory_deleted/results reported no match) — scope or ids may not match what was ingested`
-        );
-      }
-      return data;
+      const { deletedIds, failedIds } = classifyDeletion(requestedIds, envelope, data);
+      return { deletedIds, failedIds, data };
     }
   };
 
