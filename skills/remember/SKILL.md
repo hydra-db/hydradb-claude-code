@@ -1,6 +1,6 @@
 ---
 name: remember
-description: Store a durable note, preference, or decision in HydraDB memory. Use when the user explicitly wants Claude Code to remember something.
+description: Deprecated alias for /hydradb:ingest. Store a durable note, preference, or decision in HydraDB memory. Prefer /hydradb:ingest; this still works.
 disable-model-invocation: true
 allowed-tools: Bash(node *)
 argument-hint: "<text to remember>"

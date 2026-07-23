@@ -1,0 +1,14 @@
+[
+  "additionalContext",
+  "emitted",
+  "errors[]",
+  "knowledgeCount",
+  "knowledgeGraphPathCount",
+  "memoryCount",
+  "memoryGraphPathCount",
+  "query",
+  "searchMode",
+  "sessionId",
+  "skipped",
+  "updatedAt"
+]

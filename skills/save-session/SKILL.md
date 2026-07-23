@@ -1,6 +1,6 @@
 ---
 name: save-session
-description: Save the current Claude Code session into HydraDB as one evolving session memory. Use when the user explicitly asks to save the whole conversation, the current session, or everything discussed so far to HydraDB.
+description: Deprecated alias for /hydradb:ingest. Save the current Claude Code session into HydraDB as one evolving session memory. Prefer /hydradb:ingest; this still works.
 allowed-tools: Bash(node *)
 argument-hint: "[session-id]"
 ---

@@ -511,34 +511,46 @@ export async function syncWorkspace({
     }
 
     if (memoryIdsToDelete.size) {
-      await client.deleteMemories([...memoryIdsToDelete], {
-        timeoutMs: config.writeTimeoutMs
-      });
-
-      for (const entry of deletedMemoryPaths) {
-        delete state.files[entry.filePath];
-        summary.deleted += 1;
-        summary.deletedFiles.push({
-          path: entry.relPath,
-          target: "memory",
-          reason: entry.reason
+      // Only reconcile tracked state when the delete actually succeeded. The
+      // client now raises on a {success:false}/user_memory_deleted:false body
+      // (previously a silent 200 that dropped state for undeleted sources); on
+      // failure we surface it and leave the entries so the next sync retries.
+      try {
+        await client.deleteMemories([...memoryIdsToDelete], {
+          timeoutMs: config.writeTimeoutMs
         });
+
+        for (const entry of deletedMemoryPaths) {
+          delete state.files[entry.filePath];
+          summary.deleted += 1;
+          summary.deletedFiles.push({
+            path: entry.relPath,
+            target: "memory",
+            reason: entry.reason
+          });
+        }
+      } catch (error) {
+        summary.errors.push(`memory delete failed: ${error.message}`);
       }
     }
 
     if (knowledgeIdsToDelete.length) {
-      await client.deleteKnowledge(knowledgeIdsToDelete, {
-        timeoutMs: config.writeTimeoutMs
-      });
-
-      for (const entry of deletedKnowledgePaths) {
-        delete state.files[entry.filePath];
-        summary.deleted += 1;
-        summary.deletedFiles.push({
-          path: entry.relPath,
-          target: "knowledge",
-          reason: entry.reason
+      try {
+        await client.deleteKnowledge(knowledgeIdsToDelete, {
+          timeoutMs: config.writeTimeoutMs
         });
+
+        for (const entry of deletedKnowledgePaths) {
+          delete state.files[entry.filePath];
+          summary.deleted += 1;
+          summary.deletedFiles.push({
+            path: entry.relPath,
+            target: "knowledge",
+            reason: entry.reason
+          });
+        }
+      } catch (error) {
+        summary.errors.push(`knowledge delete failed: ${error.message}`);
       }
     }
   }

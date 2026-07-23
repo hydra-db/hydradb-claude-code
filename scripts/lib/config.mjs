@@ -99,6 +99,57 @@ function envOrUndefined(name) {
   return process.env[name];
 }
 
+// Deprecated env-var aliases per the shared client contract (CONTRACT §1). The
+// canonical `HYDRADB_*` name wins if both are set; otherwise the first set alias
+// is honoured and its use is warned about exactly once per process.
+//
+// Per-client scoping (CONTRACT §1): a client reads the canonical name plus ONLY
+// the legacy prefix(es) it itself historically shipped. This plugin ships
+// `HYDRADB_*` and reads the `HYDRA_DB_*` spellings; it must NOT read another
+// client's prefix, so `HYDRA_OPENCLAW_*` is deliberately absent here.
+const ENV_ALIASES = {
+  apiKey: { canonical: "HYDRADB_API_KEY", deprecated: ["HYDRA_DB_API_KEY"] },
+  tenantId: {
+    canonical: "HYDRADB_DATABASE",
+    deprecated: ["HYDRADB_TENANT_ID", "HYDRA_DB_TENANT_ID"]
+  },
+  subTenantId: {
+    canonical: "HYDRADB_COLLECTION",
+    deprecated: ["HYDRADB_SUB_TENANT_ID", "HYDRA_DB_SUB_TENANT_ID"]
+  },
+  apiBaseUrl: { canonical: "HYDRADB_BASE_URL", deprecated: ["HYDRA_DB_BASE_URL", "HYDRADB_API_URL"] }
+};
+
+const warnedEnvAliases = new Set();
+
+function warnEnvAliasOnce(deprecatedName, canonicalName) {
+  if (warnedEnvAliases.has(deprecatedName)) {
+    return;
+  }
+  warnedEnvAliases.add(deprecatedName);
+  process.stderr.write(
+    `[hydradb] ${deprecatedName} is deprecated; use ${canonicalName} instead.\n`
+  );
+}
+
+// Returns the value of the canonical env var, or the first set deprecated alias
+// (emitting one warning). "Set" means present in the environment even if empty,
+// so an explicit empty collection/sub-tenant is preserved.
+function resolveAliasedEnv({ canonical, deprecated }) {
+  const canonicalValue = process.env[canonical];
+  if (canonicalValue !== undefined) {
+    return canonicalValue;
+  }
+  for (const name of deprecated) {
+    const value = process.env[name];
+    if (value !== undefined) {
+      warnEnvAliasOnce(name, canonical);
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function resolveEnvString(value) {
   if (typeof value !== "string") {
     return value;
@@ -297,10 +348,10 @@ export async function loadConfig(cwd, dataDir) {
   }
 
   const envOverrides = {
-    apiBaseUrl: envOrUndefined("HYDRADB_BASE_URL"),
-    apiKey: envOrUndefined("HYDRADB_API_KEY"),
-    tenantId: envOrUndefined("HYDRADB_TENANT_ID"),
-    subTenantId: envOrUndefined("HYDRADB_SUB_TENANT_ID"),
+    apiBaseUrl: resolveAliasedEnv(ENV_ALIASES.apiBaseUrl),
+    apiKey: resolveAliasedEnv(ENV_ALIASES.apiKey),
+    tenantId: resolveAliasedEnv(ENV_ALIASES.tenantId),
+    subTenantId: resolveAliasedEnv(ENV_ALIASES.subTenantId),
     userName: envOrUndefined("HYDRADB_USER_NAME"),
     captureMode: envOrUndefined("HYDRADB_CAPTURE_MODE"),
     searchMode: envOrUndefined("HYDRADB_SEARCH_MODE"),

@@ -39,6 +39,11 @@
   },
   "scripts": {
     "check": "node scripts/check.mjs",
+    "build:vendor": "node scripts/build-vendor.mjs",
     "pack:dry-run": "npm pack --dry-run"
+  },
+  "devDependencies": {
+    "@hydradb/sdk": "2.1.2",
+    "esbuild": "0.28.1"
   }
 }
