@@ -1,4 +1,4 @@
-import { createHydraWrapper, snakeCaseKeys } from "./hydra/index.mjs";
+import { createHydraWrapper } from "./hydra/index.mjs";
 import { redactSecrets } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
@@ -313,15 +313,12 @@ function extractDetailedQueryPaths(response) {
   return paths.map((entry) => sanitizePath(entry)).filter(Boolean).slice(0, 4);
 }
 
-// The SDK deserializes the v2 wire response into camelCase (chunkContent,
-// sourceTitle, graphContext, queryPaths, chunkIdToGroupIds, …) while the
-// normalizer below reads the historical snake_case wire names. Rather than
-// touch the polymorphic normalizer (kept verbatim — it still tolerates the many
-// v1 field spellings), snake_case the input keys once at the door via the
-// shared helper. Idempotent on already-snake_case input, so direct/legacy
-// callers and the conformance golden fixtures are unaffected.
-export function normalizeRetrievalResponse(rawResponse) {
-  const response = snakeCaseKeys(rawResponse);
+// Reads the historical snake_case retrieval shape. Its input already arrives
+// snake_cased: recall flows through the wrapper's single normalization seam
+// (scripts/lib/hydra/), which unwraps and snake_cases every SDK response, and
+// the check/golden fixtures are authored snake_case. The polymorphic normalizer
+// is otherwise kept verbatim — it still tolerates the many v1 field spellings.
+export function normalizeRetrievalResponse(response) {
   const rawChunks = response?.chunks || response?.results || response?.context || [];
   const chunks = Array.isArray(rawChunks)
     ? rawChunks

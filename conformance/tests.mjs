@@ -191,8 +191,14 @@ export async function runHttpTests() {
       /deleted nothing/,
       "camelCase userMemoryDeleted:false must surface as a no-op failure"
     );
-    // A genuine deletion must NOT throw.
+    await assert.rejects(
+      () => wrap({ success: true, data: { userMemoryDeleted: 0 } }).context.delete({ ids: ["m"], kind: "memory" }),
+      /deleted nothing/,
+      "NUMERIC userMemoryDeleted:0 must surface as a no-op failure (not just boolean false)"
+    );
+    // Genuine deletions must NOT throw (numeric truthy + boolean true).
     await wrap({ success: true, data: { deletedCount: 2 } }).context.delete({ ids: ["a", "b"], kind: "knowledge" });
+    await wrap({ success: true, data: { userMemoryDeleted: 1 } }).context.delete({ ids: ["m"], kind: "memory" });
   }
 
   // 8) End-to-end: a failed workspace delete must surface into summary.errors AND
@@ -244,7 +250,30 @@ export async function runHttpTests() {
     assert.ok(state.files[filePath], "tracked state must be RETAINED after a failed delete, for retry");
   }
 
-  return { tests: 8 };
+  // 9) The single normalization seam: EVERY wrapper method returns snake_cased
+  //    data regardless of the SDK's camelCase, so all downstream readers are
+  //    insulated in one place. Guards the whole camelCase class, not one site.
+  {
+    const spy = {
+      query: async () => ({ success: true, data: { chunks: [{ chunkContent: "c", sourceTitle: "T" }] } }),
+      context: {
+        list: async () => ({ success: true, data: { sources: [{ sourceId: "s1", sourceTitle: "T", isMemory: true }] } }),
+        inspect: async () => ({ success: true, data: { sourceId: "s1", chunkContent: "body" } })
+      }
+    };
+    const w = createHydraWrapper({ apiKey: "k", tenantId: "db_test", subTenantId: "col_test", sdkClient: spy });
+    const q = await w.context.query({ query: "x", kind: "memory" });
+    assert.equal(q.chunks[0].chunk_content, "c", "query result must be snake_cased at the seam");
+    assert.equal(q.chunks[0].source_title, "T");
+    const list = await w.context.list({ kind: "knowledge" });
+    assert.equal(list.sources[0].source_id, "s1", "list result must be snake_cased at the seam");
+    assert.equal(list.sources[0].is_memory, true);
+    const inspect = await w.context.inspect({ id: "s1" });
+    assert.equal(inspect.source_id, "s1", "inspect result must be snake_cased at the seam");
+    assert.equal(inspect.chunk_content, "body");
+  }
+
+  return { tests: 9 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

@@ -80,20 +80,23 @@ export function snakeCaseKeys(value) {
   return value;
 }
 
-// Unwrap HandlerEnvelope{data,success,meta} → data, but only when the envelope
-// shape is actually present (CONTRACT §2 rule 2 — never assume it).
-function unwrapEnvelope(value) {
-  if (
-    value &&
-    typeof value === "object" &&
-    "data" in value &&
-    ("success" in value || "meta" in value)
-  ) {
-    return value.data;
-  }
-  return value;
+// THE single normalization seam. Every wrapper method funnels its result
+// through here: unwrap HandlerEnvelope{data,success,meta} → data (by shape,
+// CONTRACT §2 rule 2 — never assumed), then snake_case the keys. The SDK
+// deserializes EVERY v2 response to camelCase; doing the camelCase→snake_case
+// conversion once, here, means every downstream reader (the retrieval
+// normalizer, the delete no-op check, and any future caller) sees the plugin's
+// historical snake_case shape and needs no per-site handling.
+function unwrapAndNormalize(value) {
+  const data =
+    value && typeof value === "object" && "data" in value && ("success" in value || "meta" in value)
+      ? value.data
+      : value;
+  return snakeCaseKeys(data);
 }
 
+// Envelope-level success flag. `success` is spelled the same in camelCase and
+// snake_case, so this reads the raw envelope directly.
 function isEnvelopeSuccessFalse(value) {
   return Boolean(value && typeof value === "object" && "success" in value && value.success === false);
 }
@@ -168,7 +171,7 @@ export function createHydraWrapper({
         ...(args.recencyBias != null ? { recencyBias: args.recencyBias } : {}),
         ...(args.graphContext != null ? { graphContext: args.graphContext } : {})
       };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/query", timeoutMs, () => client.query(request, requestOptions(timeoutMs)))
       );
     },
@@ -192,7 +195,7 @@ export function createHydraWrapper({
         ...(args.documents != null ? { documents: args.documents } : {}),
         ...(args.upsert != null ? { upsert: String(args.upsert) } : {})
       };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/context/ingest", timeoutMs, () => client.context.ingest(request, requestOptions(timeoutMs)))
       );
     },
@@ -200,7 +203,7 @@ export function createHydraWrapper({
     async list(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       const request = { ...contextScope(), ...(args.kind ? { type: args.kind } : {}) };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/context/list", timeoutMs, () => client.context.list(request, requestOptions(timeoutMs)))
       );
     },
@@ -208,7 +211,7 @@ export function createHydraWrapper({
     async inspect(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       const request = { ...contextScope(), id: args.id, ...(args.mode ? { mode: args.mode } : {}) };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/context/inspect", timeoutMs, () => client.context.inspect(request, requestOptions(timeoutMs)))
       );
     },
@@ -217,7 +220,7 @@ export function createHydraWrapper({
     async ingestionStatus(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       const request = { ...contextScope(), ...(args.ids ? { ids: args.ids } : {}) };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/context/status", timeoutMs, () => client.context.status(request, requestOptions(timeoutMs)))
       );
     },
@@ -225,7 +228,7 @@ export function createHydraWrapper({
     async relations(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       const request = { ...contextScope(), ...(args.id ? { id: args.id } : {}) };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/context/relations", timeoutMs, () => client.context.relations(request, requestOptions(timeoutMs)))
       );
     },
@@ -246,24 +249,25 @@ export function createHydraWrapper({
       const envelope = await call("/context (delete)", timeoutMs, () =>
         client.context.delete(request, requestOptions(timeoutMs))
       );
-      // Normalize keys before inspecting: the SDK returns camelCase
-      // (deletedCount/userMemoryDeleted), and reading snake_case here would miss
-      // the zero-match no-op and silently "succeed" — the very bug being fixed.
-      const normalizedEnvelope = snakeCaseKeys(envelope);
-      const checkData = unwrapEnvelope(normalizedEnvelope) ?? {};
+      // `data` is already unwrapped + snake_cased by the seam. Detect a no-op
+      // robustly: the server reports "nothing matched" as `deleted_count: 0`, or
+      // `user_memory_deleted` false — and that flag arrives as either boolean
+      // `false` OR numeric `0`, so test truthiness (guarding undefined for the
+      // other kind) rather than `=== false`.
+      const data = unwrapAndNormalize(envelope) ?? {};
+      const memoryNotDeleted =
+        data.user_memory_deleted !== undefined && !data.user_memory_deleted;
+      const nothingDeleted =
+        requestedIds.length > 0 && data.deleted_count !== undefined && Number(data.deleted_count) === 0;
       const failed =
-        isEnvelopeSuccessFalse(normalizedEnvelope) ||
-        (checkData && typeof checkData === "object" &&
-          (checkData.success === false ||
-            checkData.user_memory_deleted === false ||
-            (requestedIds.length > 0 && checkData.deleted_count === 0)));
+        isEnvelopeSuccessFalse(envelope) || data.success === false || memoryNotDeleted || nothingDeleted;
       if (failed) {
         throw new HydraWrapperError(
           `/context (delete) deleted nothing for ${JSON.stringify(requestedIds)} ` +
-            `(success/deleted_count reported no match) — scope or ids may not match what was ingested`
+            `(success/deleted_count/user_memory_deleted reported no match) — scope or ids may not match what was ingested`
         );
       }
-      return unwrapEnvelope(envelope);
+      return data;
     }
   };
 
@@ -272,13 +276,13 @@ export function createHydraWrapper({
     async create(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
       const request = { database: args.database, ...(args.extra || {}) };
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases (create)", timeoutMs, () => client.databases.create(request, requestOptions(timeoutMs)))
       );
     },
     async delete(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases (delete)", timeoutMs, () =>
           client.databases.delete({ database: args.database }, requestOptions(timeoutMs))
         )
@@ -286,13 +290,13 @@ export function createHydraWrapper({
     },
     async list(opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases", timeoutMs, () => client.databases.list(requestOptions(timeoutMs)))
       );
     },
     async collections(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases/collections", timeoutMs, () =>
           client.databases.collections({ database: args.database }, requestOptions(timeoutMs))
         )
@@ -300,7 +304,7 @@ export function createHydraWrapper({
     },
     async stats(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases/stats", timeoutMs, () =>
           client.databases.stats({ database: args.database }, requestOptions(timeoutMs))
         )
@@ -309,7 +313,7 @@ export function createHydraWrapper({
     // Infra provisioning readiness — renamed away from the overloaded `status`.
     async readiness(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
-      return unwrapEnvelope(
+      return unwrapAndNormalize(
         await call("/databases/status", timeoutMs, () =>
           client.databases.status({ database: args.database }, requestOptions(timeoutMs))
         )
