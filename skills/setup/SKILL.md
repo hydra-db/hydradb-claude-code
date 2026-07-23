@@ -10,7 +10,7 @@ Configure the HydraDB plugin for the current workspace.
 1. Check current status first:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" status --json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" doctor --json
 ```
 
 2. If HydraDB is already configured, explain which config layers are active and whether anything still needs to change.
@@ -57,7 +57,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" status --json
 8. After any config edit, recommend running:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" status
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" doctor
 ```
 
 9. If the user wants manual-only memory, set `captureMode` to `off` and point them to `/hydradb:remember` or `/hydradb:save-session`.

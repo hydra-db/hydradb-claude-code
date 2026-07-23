@@ -11,7 +11,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
+import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
 
 function fakeResponse(payload) {
   const text = JSON.stringify(payload);
@@ -167,7 +169,82 @@ export async function runHttpTests() {
     assert.equal(recall.chunks[0].sourceId, "s1");
   }
 
-  return { tests: 6 };
+  // 7) camelCase delete no-op detection. The SDK deserializes the delete
+  //    envelope to camelCase (deletedCount / userMemoryDeleted); a snake_case-only
+  //    check would MISS the zero-match no-op and silently "succeed". Inject a spy
+  //    SDK returning the exact camelCase shapes the real SDK produces.
+  {
+    const wrap = (envelope) =>
+      createHydraWrapper({
+        apiKey: "k",
+        tenantId: "db_test",
+        subTenantId: "col_test",
+        sdkClient: { context: { delete: async () => envelope } }
+      });
+    await assert.rejects(
+      () => wrap({ success: true, data: { deletedCount: 0 } }).context.delete({ ids: ["x"], kind: "knowledge" }),
+      /deleted nothing/,
+      "camelCase deletedCount:0 must surface as a no-op failure"
+    );
+    await assert.rejects(
+      () => wrap({ success: true, data: { userMemoryDeleted: false } }).context.delete({ ids: ["m"], kind: "memory" }),
+      /deleted nothing/,
+      "camelCase userMemoryDeleted:false must surface as a no-op failure"
+    );
+    // A genuine deletion must NOT throw.
+    await wrap({ success: true, data: { deletedCount: 2 } }).context.delete({ ids: ["a", "b"], kind: "knowledge" });
+  }
+
+  // 8) End-to-end: a failed workspace delete must surface into summary.errors AND
+  //    RETAIN tracked state (so the next sync retries) — never silently drop the
+  //    entry, which is how the second silent bug hid.
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-del-retain-"));
+    const filePath = path.join(dir, "CLAUDE.md"); // absent on disk → triggers a delete
+    const state = {
+      files: {
+        [filePath]: { digest: "d", relPath: "CLAUDE.md", syncedAt: "2026-01-01T00:00:00.000Z", target: "knowledge", chunkCount: 1 }
+      },
+      sessions: {},
+      lastSessionId: "",
+      lastRecall: null
+    };
+    const throwingClient = {
+      tenantId: "db_test",
+      subTenantId: "col_test",
+      addMemories: async () => {},
+      uploadKnowledge: async () => {},
+      deleteMemories: async () => {},
+      deleteKnowledge: async () => {
+        throw new Error("/context (delete) deleted nothing for [\"…\"]");
+      }
+    };
+    const summary = await syncWorkspace({
+      client: throwingClient,
+      config: {
+        includeGlobs: ["CLAUDE.md"],
+        excludeGlobs: [],
+        maxFileSizeBytes: 50 * 1024 * 1024,
+        maxFilesPerSync: 25,
+        maxMemoryCharsPerChunk: 50 * 1024 * 1024,
+        maxMemoryChunksPerFile: 1,
+        ingestionMode: "knowledge",
+        writeTimeoutMs: 15000,
+        userName: "",
+        workspaceMemoryCustomInstructions: ""
+      },
+      projectRoot: dir,
+      workspaceName: "t",
+      state
+    });
+    assert.ok(
+      summary.errors.some((e) => /knowledge delete failed/.test(e)),
+      "a failed delete must surface into summary.errors"
+    );
+    assert.ok(state.files[filePath], "tracked state must be RETAINED after a failed delete, for retry");
+  }
+
+  return { tests: 8 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

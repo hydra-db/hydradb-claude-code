@@ -1,4 +1,4 @@
-import { createHydraWrapper } from "./hydra/index.mjs";
+import { createHydraWrapper, snakeCaseKeys } from "./hydra/index.mjs";
 import { redactSecrets } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
@@ -317,24 +317,9 @@ function extractDetailedQueryPaths(response) {
 // sourceTitle, graphContext, queryPaths, chunkIdToGroupIds, …) while the
 // normalizer below reads the historical snake_case wire names. Rather than
 // touch the polymorphic normalizer (kept verbatim — it still tolerates the many
-// v1 field spellings), recursively snake_case the input keys once at the door.
-// This is idempotent on already-snake_case input, so direct/legacy callers and
-// the conformance golden fixtures are unaffected. Values are never touched.
-function snakeCaseKeys(value) {
-  if (Array.isArray(value)) {
-    return value.map((entry) => snakeCaseKeys(entry));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [
-        key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase(),
-        snakeCaseKeys(entry)
-      ])
-    );
-  }
-  return value;
-}
-
+// v1 field spellings), snake_case the input keys once at the door via the
+// shared helper. Idempotent on already-snake_case input, so direct/legacy
+// callers and the conformance golden fixtures are unaffected.
 export function normalizeRetrievalResponse(rawResponse) {
   const response = snakeCaseKeys(rawResponse);
   const rawChunks = response?.chunks || response?.results || response?.context || [];

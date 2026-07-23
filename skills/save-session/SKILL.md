@@ -8,7 +8,7 @@ argument-hint: "[session-id]"
 Save the current buffered session into HydraDB:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" save-session --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" ingest --session --json "$ARGUMENTS"
 ```
 
 If no session id is provided, use the most recently active session tracked by the plugin. Confirm how many turns were saved, and explain that repeated saves for the same session upsert a single session-level memory in HydraDB.

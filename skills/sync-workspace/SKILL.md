@@ -9,7 +9,7 @@ argument-hint: "[--force]"
 Sync the current workspace context files into HydraDB:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" sync-workspace --json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" ingest --json $ARGUMENTS
 ```
 
 Report:

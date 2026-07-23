@@ -582,11 +582,11 @@ function usage() {
       "  node scripts/plugin.mjs post-tool-use",
       "  node scripts/plugin.mjs stop",
       "  node scripts/plugin.mjs query [--json] <query>",
-      "  node scripts/plugin.mjs ingest [--json] [--force]",
+      "  node scripts/plugin.mjs ingest [--json] [--force]            (sync workspace)",
+      "  node scripts/plugin.mjs ingest --note [--json] <text>        (store a memory)",
+      "  node scripts/plugin.mjs ingest --session [--json] [id]       (upsert session)",
       "  node scripts/plugin.mjs doctor [--json]",
       "  node scripts/plugin.mjs last-recall [--json]",
-      "  node scripts/plugin.mjs remember <text>",
-      "  node scripts/plugin.mjs save-session [--json] [session-id]",
       "",
       "  Deprecated aliases (still work, one warning): search|recall -> query,",
       "  status -> doctor, remember|save-session|sync-workspace|reindex -> ingest"
@@ -865,6 +865,24 @@ async function handleSearch(args) {
   await handleRecall(args, "search");
 }
 
+// Canonical write umbrella (CONTRACT §3): `ingest` covers the three prior write
+// actions. `--note <text>` stores a memory (was `remember`); `--session [id]`
+// upserts the session (was `save-session`); with neither it syncs the workspace
+// (was `sync-workspace`/`reindex`). This lets the plugin's own skills call the
+// canonical command directly instead of the deprecated names.
+async function handleIngest(args) {
+  if (args.includes("--session")) {
+    await handleSaveSession(args.filter((arg) => arg !== "--session"));
+    return;
+  }
+  const noteIndex = args.indexOf("--note");
+  if (noteIndex !== -1) {
+    await handleRemember(args.slice(noteIndex + 1));
+    return;
+  }
+  await handleSyncWorkspace(args);
+}
+
 // User-facing command names aligned to the shared contract (CONTRACT §3). Every
 // prior name keeps working as a deprecated alias that emits exactly one stderr
 // warning naming its canonical replacement. The warning goes to stderr so it
@@ -913,7 +931,7 @@ async function main() {
       await handleRecall(args, "query");
       return;
     case "ingest":
-      await handleSyncWorkspace(args);
+      await handleIngest(args);
       return;
     case "doctor":
       await handleStatus(args);

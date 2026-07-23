@@ -8,7 +8,7 @@ user-invocable: false
 Query HydraDB for relevant long-term context using the user's current question or a concise reformulation:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" search --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" query --json "$ARGUMENTS"
 ```
 
 Use the returned HydraDB results as supporting context for the answer.

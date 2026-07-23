@@ -60,6 +60,26 @@ function translateError(error, label, timeoutMs) {
   return new HydraWrapperError(`${label} failed: ${message}`);
 }
 
+// The SDK deserializes the v2 wire response into camelCase (deletedCount,
+// userMemoryDeleted, chunkContent, …) while the plugin's historical logic reads
+// snake_case wire names. Recursively snake_case object keys so both the delete
+// no-op detection here and the retrieval normalizer (which imports this) can
+// read one spelling. Idempotent on already-snake_case input; values untouched.
+export function snakeCaseKeys(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => snakeCaseKeys(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase(),
+        snakeCaseKeys(entry)
+      ])
+    );
+  }
+  return value;
+}
+
 // Unwrap HandlerEnvelope{data,success,meta} → data, but only when the envelope
 // shape is actually present (CONTRACT §2 rule 2 — never assume it).
 function unwrapEnvelope(value) {
@@ -226,20 +246,24 @@ export function createHydraWrapper({
       const envelope = await call("/context (delete)", timeoutMs, () =>
         client.context.delete(request, requestOptions(timeoutMs))
       );
-      const data = unwrapEnvelope(envelope);
+      // Normalize keys before inspecting: the SDK returns camelCase
+      // (deletedCount/userMemoryDeleted), and reading snake_case here would miss
+      // the zero-match no-op and silently "succeed" — the very bug being fixed.
+      const normalizedEnvelope = snakeCaseKeys(envelope);
+      const checkData = unwrapEnvelope(normalizedEnvelope) ?? {};
       const failed =
-        isEnvelopeSuccessFalse(envelope) ||
-        (data && typeof data === "object" &&
-          (data.success === false ||
-            data.user_memory_deleted === false ||
-            (requestedIds.length > 0 && data.deleted_count === 0)));
+        isEnvelopeSuccessFalse(normalizedEnvelope) ||
+        (checkData && typeof checkData === "object" &&
+          (checkData.success === false ||
+            checkData.user_memory_deleted === false ||
+            (requestedIds.length > 0 && checkData.deleted_count === 0)));
       if (failed) {
         throw new HydraWrapperError(
           `/context (delete) deleted nothing for ${JSON.stringify(requestedIds)} ` +
             `(success/deleted_count reported no match) — scope or ids may not match what was ingested`
         );
       }
-      return data;
+      return unwrapEnvelope(envelope);
     }
   };
 

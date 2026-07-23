@@ -122,7 +122,7 @@ await fs.writeFile(
   "utf8"
 );
 
-const statusRaw = execFileSync(process.execPath, [path.join(root, "scripts/plugin.mjs"), "status", "--json"], {
+const statusRaw = execFileSync(process.execPath, [path.join(root, "scripts/plugin.mjs"), "doctor", "--json"], {
   env: baseEnv,
   encoding: "utf8"
 }).trim();
@@ -153,7 +153,7 @@ await fs.writeFile(
 
 const inlineStatusRaw = execFileSync(
   process.execPath,
-  [path.join(root, "scripts/plugin.mjs"), "status", "--json"],
+  [path.join(root, "scripts/plugin.mjs"), "doctor", "--json"],
   {
     env: {
       ...process.env,
