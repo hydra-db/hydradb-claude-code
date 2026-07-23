@@ -196,9 +196,19 @@ export async function runHttpTests() {
       /deleted nothing/,
       "NUMERIC userMemoryDeleted:0 must surface as a no-op failure (not just boolean false)"
     );
-    // Genuine deletions must NOT throw (numeric truthy + boolean true).
+    // Per-item results: all items failed (deleted:false) is a no-op failure.
+    await assert.rejects(
+      () =>
+        wrap({ success: true, data: { results: [{ id: "a", deleted: false, error: "not found" }] } })
+          .context.delete({ ids: ["a"], kind: "knowledge" }),
+      /deleted nothing/,
+      "results[] with every item deleted:false must surface as a no-op failure"
+    );
+    // Genuine deletions must NOT throw (numeric truthy count, boolean true, or a
+    // results item that actually deleted).
     await wrap({ success: true, data: { deletedCount: 2 } }).context.delete({ ids: ["a", "b"], kind: "knowledge" });
     await wrap({ success: true, data: { userMemoryDeleted: 1 } }).context.delete({ ids: ["m"], kind: "memory" });
+    await wrap({ success: true, data: { results: [{ id: "a", deleted: true }] } }).context.delete({ ids: ["a"], kind: "knowledge" });
   }
 
   // 8) End-to-end: a failed workspace delete must surface into summary.errors AND

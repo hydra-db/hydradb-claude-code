@@ -249,22 +249,35 @@ export function createHydraWrapper({
       const envelope = await call("/context (delete)", timeoutMs, () =>
         client.context.delete(request, requestOptions(timeoutMs))
       );
-      // `data` is already unwrapped + snake_cased by the seam. Detect a no-op
-      // robustly: the server reports "nothing matched" as `deleted_count: 0`, or
-      // `user_memory_deleted` false — and that flag arrives as either boolean
-      // `false` OR numeric `0`, so test truthiness (guarding undefined for the
-      // other kind) rather than `=== false`.
+      // `data` is already unwrapped + snake_cased by the seam. The SDK delete
+      // response (HandlerEnvelopeSourcesMemoryDeleteResponse) signals a no-op
+      // across several fields, and — critically — the counts are INTEGERS (0 =
+      // no match), NOT booleans. Enumerated from the SDK type so this can't be
+      // wrong on another axis:
+      //   envelope.success / data.success        → boolean
+      //   data.deleted_count                      → number (sources deleted)
+      //   data.user_memory_deleted                → number (memories deleted)
+      //   data.results[].deleted                  → per-item boolean
+      // Treat the delete as a FAILURE when any PRESENT signal reports that
+      // nothing was deleted — using `=== 0` on the numeric fields, never
+      // `=== false`. Absent fields never trigger a false failure.
       const data = unwrapAndNormalize(envelope) ?? {};
-      const memoryNotDeleted =
-        data.user_memory_deleted !== undefined && !data.user_memory_deleted;
-      const nothingDeleted =
+      const deletedNoSources =
         requestedIds.length > 0 && data.deleted_count !== undefined && Number(data.deleted_count) === 0;
+      const deletedNoMemory =
+        data.user_memory_deleted !== undefined && Number(data.user_memory_deleted) === 0;
+      const everyResultFailed =
+        Array.isArray(data.results) && data.results.length > 0 && data.results.every((r) => r && r.deleted === false);
       const failed =
-        isEnvelopeSuccessFalse(envelope) || data.success === false || memoryNotDeleted || nothingDeleted;
+        isEnvelopeSuccessFalse(envelope) ||
+        data.success === false ||
+        deletedNoSources ||
+        deletedNoMemory ||
+        everyResultFailed;
       if (failed) {
         throw new HydraWrapperError(
           `/context (delete) deleted nothing for ${JSON.stringify(requestedIds)} ` +
-            `(success/deleted_count/user_memory_deleted reported no match) — scope or ids may not match what was ingested`
+            `(success/deleted_count/user_memory_deleted/results reported no match) — scope or ids may not match what was ingested`
         );
       }
       return data;
