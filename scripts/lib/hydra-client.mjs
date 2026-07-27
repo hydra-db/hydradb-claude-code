@@ -1,3 +1,4 @@
+import { createHydraWrapper } from "./hydra/index.mjs";
 import { redactSecrets } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
@@ -312,6 +313,11 @@ function extractDetailedQueryPaths(response) {
   return paths.map((entry) => sanitizePath(entry)).filter(Boolean).slice(0, 4);
 }
 
+// Reads the historical snake_case retrieval shape. Its input already arrives
+// snake_cased: recall flows through the wrapper's single normalization seam
+// (scripts/lib/hydra/), which unwraps and snake_cases every SDK response, and
+// the check/golden fixtures are authored snake_case. The polymorphic normalizer
+// is otherwise kept verbatim — it still tolerates the many v1 field spellings.
 export function normalizeRetrievalResponse(response) {
   const rawChunks = response?.chunks || response?.results || response?.context || [];
   const chunks = Array.isArray(rawChunks)
@@ -366,98 +372,76 @@ export class HydraClient {
     subTenantId,
     baseUrl = DEFAULT_API_BASE,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-    writeTimeoutMs = DEFAULT_WRITE_TIMEOUT_MS
-  }) {
-    this.apiKey = apiKey;
+    writeTimeoutMs = DEFAULT_WRITE_TIMEOUT_MS,
+    // Test seams only (never set in production): inject a capturing fetch or a
+    // spy SDK client so wire-level tests need no network. Forwarded verbatim.
+    fetch: fetchImpl,
+    sdkClient
+  } = {}) {
+    // Kept as public fields: plugin code duck-types tenantId/subTenantId
+    // (workspace-sync.mjs) and other call sites read them directly.
     this.tenantId = tenantId;
     this.subTenantId = subTenantId;
-    this.baseUrl = baseUrl.replace(/\/+$/g, "");
     this.requestTimeoutMs = requestTimeoutMs;
     this.writeTimeoutMs = writeTimeoutMs;
-  }
-
-  async request(path, body, options = {}) {
-    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
-    let response;
-
-    try {
-      response = await fetch(`${this.baseUrl}${path}`, {
-        method: options.method || "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: body == null ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs)
-      });
-    } catch (error) {
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw new Error(`${path} timed out after ${timeoutMs}ms`);
-      }
-      throw error;
-    }
-
-    if (!response.ok) {
-      const text = trimText(await response.text().catch(() => ""));
-      throw new Error(`${path} failed with ${response.status}${text ? `: ${text}` : ""}`);
-    }
-
-    if (response.status === 204) {
-      return {};
-    }
-
-    return response.json();
+    // All wire I/O now flows through the canonical wrapper over the vendored SDK.
+    this._hydra = createHydraWrapper({
+      apiKey,
+      tenantId,
+      subTenantId,
+      baseUrl,
+      requestTimeoutMs,
+      writeTimeoutMs,
+      ...(fetchImpl ? { fetch: fetchImpl } : {}),
+      ...(sdkClient ? { sdkClient } : {})
+    });
   }
 
   async recallMemories(query, options = {}) {
-    const payload = {
-      tenant_id: this.tenantId,
-      sub_tenant_id: this.subTenantId,
-      query,
-      mode: options.mode || "fast",
-      max_results: options.maxResults || 6,
-      alpha: 0.8,
-      recency_bias: options.recencyBias ?? 0,
-      graph_context: options.graphContext ?? true
-    };
-
     return normalizeRetrievalResponse(
-      await this.request("/recall/recall_preferences", payload, {
-        timeoutMs: options.timeoutMs ?? this.requestTimeoutMs
-      })
+      await this._hydra.context.query(
+        {
+          query,
+          kind: "memory",
+          mode: options.mode || "fast",
+          maxResults: options.maxResults || 6,
+          alpha: 0.8,
+          recencyBias: options.recencyBias ?? 0,
+          graphContext: options.graphContext ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
+      )
     );
   }
 
   async recallKnowledge(query, options = {}) {
-    const payload = {
-      tenant_id: this.tenantId,
-      sub_tenant_id: this.subTenantId,
-      query,
-      mode: options.mode || "fast",
-      max_results: options.maxResults || 6,
-      alpha: 0.8,
-      recency_bias: options.recencyBias ?? 0,
-      graph_context: options.graphContext ?? true
-    };
-
     return normalizeRetrievalResponse(
-      await this.request("/recall/full_recall", payload, {
-        timeoutMs: options.timeoutMs ?? this.requestTimeoutMs
-      })
+      await this._hydra.context.query(
+        {
+          query,
+          kind: "knowledge",
+          mode: options.mode || "fast",
+          maxResults: options.maxResults || 6,
+          alpha: 0.8,
+          recencyBias: options.recencyBias ?? 0,
+          graphContext: options.graphContext ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
+      )
     );
   }
 
   async addMemories(memories, options = {}) {
-    const payload = {
-      memories,
-      tenant_id: this.tenantId,
-      sub_tenant_id: this.subTenantId,
-      upsert: options.upsert ?? true
-    };
-
-    return this.request("/memories/add_memory", payload, {
-      timeoutMs: options.timeoutMs ?? this.writeTimeoutMs
-    });
+    // The SDK carries memory items as a JSON string in the multipart `memories`
+    // field; scope and type=memory are supplied by the wrapper.
+    return this._hydra.context.ingest(
+      {
+        kind: "memory",
+        memories: JSON.stringify(memories),
+        upsert: options.upsert ?? true
+      },
+      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+    );
   }
 
   async addTextMemory(text, options = {}) {
@@ -501,90 +485,51 @@ export class HydraClient {
   }
 
   async uploadKnowledge(appKnowledge) {
-    const payload = {
-      app_knowledge: appKnowledge
-    };
+    // DX-G-002 fix: knowledge ingests via the SDK's multipart context.ingest,
+    // carrying the structured items in `appKnowledge` (a JSON string). That is
+    // multipart with a top-level tenant_id and preserves each item's
+    // client-assigned `id` verbatim — never the old JSON `{app_knowledge:[…]}`
+    // body, and never a v1 `app_sources` field.
+    return this._hydra.context.ingest(
+      {
+        kind: "knowledge",
+        appKnowledge: JSON.stringify(appKnowledge)
+      },
+      { timeoutMs: this.writeTimeoutMs }
+    );
+  }
 
-    return this.request("/ingestion/upload_knowledge", payload, {
-      timeoutMs: this.writeTimeoutMs
-    });
+  // Returns { deletedIds, failedIds, data }: which ids the server confirmed
+  // deleted vs. which it did not. The caller reconciles per id — dropping tracked
+  // state only for confirmed deletes and retaining the rest for retry — instead
+  // of treating a batched delete as an all-or-nothing success (the second silent
+  // bug, where a no-op/partial delete dropped state for context still stored).
+  async deleteMemories(memoryIds, options = {}) {
+    const ids = (memoryIds || []).filter(Boolean);
+    if (!ids.length) {
+      return { deletedIds: [], failedIds: [] };
+    }
+    return this._hydra.context.delete(
+      { ids, kind: "memory" },
+      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+    );
   }
 
   async deleteMemory(memoryId, options = {}) {
     if (!memoryId) {
-      return {
-        success: true,
-        user_memory_deleted: false
-      };
+      return { deletedIds: [], failedIds: [] };
     }
-
-    const params = new URLSearchParams();
-    params.set("tenant_id", this.tenantId);
-    params.set("memory_id", memoryId);
-    if (this.subTenantId != null) {
-      params.set("sub_tenant_id", this.subTenantId);
-    }
-
-    const timeoutMs = options.timeoutMs ?? this.writeTimeoutMs;
-    let response;
-
-    try {
-      response = await fetch(`${this.baseUrl}/memories/delete_memory?${params.toString()}`, {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          accept: "application/json"
-        },
-        signal: AbortSignal.timeout(timeoutMs)
-      });
-    } catch (error) {
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw new Error(`/memories/delete_memory timed out after ${timeoutMs}ms`);
-      }
-      throw error;
-    }
-
-    if (!response.ok) {
-      const text = trimText(await response.text().catch(() => ""));
-      throw new Error(
-        `/memories/delete_memory failed with ${response.status}${text ? `: ${text}` : ""}`
-      );
-    }
-
-    if (response.status === 204) {
-      return {};
-    }
-
-    return response.json();
-  }
-
-  async deleteMemories(memoryIds, options = {}) {
-    const results = [];
-    for (const memoryId of memoryIds) {
-      results.push(await this.deleteMemory(memoryId, options));
-    }
-    return results;
+    return this.deleteMemories([memoryId], options);
   }
 
   async deleteKnowledge(ids, options = {}) {
-    if (!Array.isArray(ids) || !ids.length) {
-      return {
-        success: true,
-        deleted_count: 0,
-        results: []
-      };
+    const knowledgeIds = (Array.isArray(ids) ? ids : []).filter(Boolean);
+    if (!knowledgeIds.length) {
+      return { deletedIds: [], failedIds: [] };
     }
-
-    return this.request(
-      "/knowledge/delete_knowledge",
-      {
-        tenant_id: this.tenantId,
-        sub_tenant_id: this.subTenantId,
-        ids
-      },
-      {
-        timeoutMs: options.timeoutMs ?? this.writeTimeoutMs
-      }
+    return this._hydra.context.delete(
+      { ids: knowledgeIds, kind: "knowledge" },
+      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
   }
 }

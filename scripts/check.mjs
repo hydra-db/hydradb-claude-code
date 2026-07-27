@@ -6,6 +6,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { runConformance } from "../conformance/runner.mjs";
+import { runGoldenTests, runHttpTests } from "../conformance/tests.mjs";
 import { normalizeRetrievalResponse } from "./lib/hydra-client.mjs";
 import { syncWorkspace } from "./lib/workspace-sync.mjs";
 
@@ -120,7 +122,7 @@ await fs.writeFile(
   "utf8"
 );
 
-const statusRaw = execFileSync(process.execPath, [path.join(root, "scripts/plugin.mjs"), "status", "--json"], {
+const statusRaw = execFileSync(process.execPath, [path.join(root, "scripts/plugin.mjs"), "doctor", "--json"], {
   env: baseEnv,
   encoding: "utf8"
 }).trim();
@@ -151,7 +153,7 @@ await fs.writeFile(
 
 const inlineStatusRaw = execFileSync(
   process.execPath,
-  [path.join(root, "scripts/plugin.mjs"), "status", "--json"],
+  [path.join(root, "scripts/plugin.mjs"), "doctor", "--json"],
   {
     env: {
       ...process.env,
@@ -255,6 +257,64 @@ await syncWorkspace({
 });
 assert.equal(syncCalls.length, 0);
 
+// ── Vendored SDK bundle: drift guard + bare-node load test ──────────────────
+// The plugin marketplace-installs via `git clone` with NO `npm install`, so the
+// SDK cannot be a runtime node_modules dependency; it is esbuild-bundled into a
+// committed self-contained file. These two checks are the whole reason that is safe.
+const vendoredBundlePath = path.join(root, "scripts/vendor/hydradb-sdk.mjs");
+await fs.access(vendoredBundlePath);
+
+// 1) Drift guard: a fresh build from the pinned SDK must be byte-identical to the
+//    committed bundle, so an SDK bump without a re-vendor fails CI.
+const freshBundlePath = path.join(
+  await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-vendor-drift-")),
+  "hydradb-sdk.mjs"
+);
+execFileSync(
+  process.execPath,
+  [path.join(root, "scripts/build-vendor.mjs"), "--out", freshBundlePath],
+  { stdio: "inherit" }
+);
+const [committedBundle, freshBundle] = await Promise.all([
+  fs.readFile(vendoredBundlePath),
+  fs.readFile(freshBundlePath)
+]);
+assert.ok(
+  committedBundle.equals(freshBundle),
+  "scripts/vendor/hydradb-sdk.mjs is stale — run `npm run build:vendor` after the SDK bump and commit the result."
+);
+
+// 2) Bare-node load test: the committed bundle must import and construct on bare
+//    `node` from a directory with NO node_modules (the exact marketplace runtime).
+const bareNodeDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-bare-node-"));
+await fs.copyFile(vendoredBundlePath, path.join(bareNodeDir, "hydradb-sdk.mjs"));
+await fs.writeFile(
+  path.join(bareNodeDir, "load-test.mjs"),
+  [
+    'import { HydraDBClient } from "./hydradb-sdk.mjs";',
+    'if (typeof HydraDBClient !== "function") { console.error("HydraDBClient missing"); process.exit(1); }',
+    'const c = new HydraDBClient({ token: "t", environment: "https://api.hydradb.com" });',
+    'if (typeof c.query !== "function" || typeof c.context?.ingest !== "function" || typeof c.context?.delete !== "function") {',
+    '  console.error("expected SDK surface missing"); process.exit(1);',
+    "}",
+    'process.stdout.write("BARE_NODE_OK");'
+  ].join("\n"),
+  "utf8"
+);
+const bareNodeOut = execFileSync(process.execPath, ["load-test.mjs"], {
+  cwd: bareNodeDir,
+  encoding: "utf8"
+}).trim();
+assert.equal(bareNodeOut, "BARE_NODE_OK", "vendored bundle failed to load on bare node");
+
+// ── Wrapper conformance + HTTP-level wire tests + golden --json shapes ───────
+const conformanceResult = await runConformance();
+const httpResult = await runHttpTests();
+const goldenResult = await runGoldenTests(root);
+
 process.stdout.write(
-  `Validated ${scriptFiles.length} core scripts, ${jsonFiles.length} JSON files, recall normalization, hook output, last-recall state, and config defaults.\n`
+  `Validated ${scriptFiles.length} core scripts, ${jsonFiles.length} JSON files, recall normalization, ` +
+    `hook output, last-recall state, config defaults, the vendored SDK bundle (drift + bare-node load), ` +
+    `${conformanceResult.ran} conformance vectors, ${httpResult.tests} HTTP-level wire tests, and ` +
+    `${goldenResult.golden} golden --json shapes.\n`
 );

@@ -481,6 +481,7 @@ export async function syncWorkspace({
           deletedMemoryPaths.push({
             filePath,
             relPath: previous.relPath,
+            ids: staleMemoryIds,
             reason: wasDeleted
               ? "deleted"
               : movedAwayFromMemory
@@ -497,10 +498,12 @@ export async function syncWorkspace({
           continue;
         }
 
-        knowledgeIdsToDelete.push(fileSourceId(projectRoot, previous.relPath));
+        const knowledgeId = fileSourceId(projectRoot, previous.relPath);
+        knowledgeIdsToDelete.push(knowledgeId);
         deletedKnowledgePaths.push({
           filePath,
           relPath: previous.relPath,
+          id: knowledgeId,
           reason: wasDeleted
             ? "deleted"
             : movedAwayFromKnowledge
@@ -510,35 +513,53 @@ export async function syncWorkspace({
       }
     }
 
+    // Reconcile deletions PER ID. The client returns which ids the server
+    // confirmed deleted; drop tracked state ONLY for a file whose every id was
+    // confirmed, and RETAIN (and surface) any file with an unconfirmed id so the
+    // next sync retries it. A partial, no-op, or failed delete therefore never
+    // drops tracking for context still stored remotely (the second silent bug).
     if (memoryIdsToDelete.size) {
-      await client.deleteMemories([...memoryIdsToDelete], {
-        timeoutMs: config.writeTimeoutMs
-      });
+      let deletedSet = new Set();
+      try {
+        const result = await client.deleteMemories([...memoryIdsToDelete], {
+          timeoutMs: config.writeTimeoutMs
+        });
+        deletedSet = new Set(result?.deletedIds || []);
+      } catch (error) {
+        summary.errors.push(`memory delete failed: ${error.message}`);
+      }
 
       for (const entry of deletedMemoryPaths) {
-        delete state.files[entry.filePath];
-        summary.deleted += 1;
-        summary.deletedFiles.push({
-          path: entry.relPath,
-          target: "memory",
-          reason: entry.reason
-        });
+        const confirmed = entry.ids.length > 0 && entry.ids.every((id) => deletedSet.has(id));
+        if (confirmed) {
+          delete state.files[entry.filePath];
+          summary.deleted += 1;
+          summary.deletedFiles.push({ path: entry.relPath, target: "memory", reason: entry.reason });
+        } else {
+          summary.errors.push(`memory delete incomplete for ${entry.relPath}; retained for retry`);
+        }
       }
     }
 
     if (knowledgeIdsToDelete.length) {
-      await client.deleteKnowledge(knowledgeIdsToDelete, {
-        timeoutMs: config.writeTimeoutMs
-      });
+      let deletedSet = new Set();
+      try {
+        const result = await client.deleteKnowledge(knowledgeIdsToDelete, {
+          timeoutMs: config.writeTimeoutMs
+        });
+        deletedSet = new Set(result?.deletedIds || []);
+      } catch (error) {
+        summary.errors.push(`knowledge delete failed: ${error.message}`);
+      }
 
       for (const entry of deletedKnowledgePaths) {
-        delete state.files[entry.filePath];
-        summary.deleted += 1;
-        summary.deletedFiles.push({
-          path: entry.relPath,
-          target: "knowledge",
-          reason: entry.reason
-        });
+        if (deletedSet.has(entry.id)) {
+          delete state.files[entry.filePath];
+          summary.deleted += 1;
+          summary.deletedFiles.push({ path: entry.relPath, target: "knowledge", reason: entry.reason });
+        } else {
+          summary.errors.push(`knowledge delete incomplete for ${entry.relPath}; retained for retry`);
+        }
       }
     }
   }

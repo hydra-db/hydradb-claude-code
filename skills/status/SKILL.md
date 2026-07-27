@@ -1,6 +1,6 @@
 ---
 name: status
-description: Inspect HydraDB plugin configuration, active settings, and sync state for the current workspace. Use when the user asks if HydraDB is working or why sync or recall is not happening.
+description: Deprecated alias for /hydradb:doctor. Inspect HydraDB plugin configuration, active settings, and sync state. Prefer /hydradb:doctor; this still works.
 disable-model-invocation: true
 allowed-tools: Bash(node *)
 ---
@@ -8,7 +8,7 @@ allowed-tools: Bash(node *)
 Check HydraDB plugin status for the current workspace:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" status --json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" doctor --json
 ```
 
 Summarize:

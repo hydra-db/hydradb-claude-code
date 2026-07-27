@@ -1,6 +1,6 @@
 ---
 name: sync-workspace
-description: Force a workspace sync of markdown-first workspace context into HydraDB. Use when the user wants an immediate refresh instead of waiting for automatic sync.
+description: Deprecated alias for /hydradb:ingest. Force a workspace sync of markdown-first workspace context into HydraDB. Prefer /hydradb:ingest; this still works.
 disable-model-invocation: true
 allowed-tools: Bash(node *)
 argument-hint: "[--force]"
@@ -9,7 +9,7 @@ argument-hint: "[--force]"
 Sync the current workspace context files into HydraDB:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" sync-workspace --json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" ingest --json $ARGUMENTS
 ```
 
 Report:
