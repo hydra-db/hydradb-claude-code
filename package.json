@@ -1,6 +1,6 @@
 {
   "name": "hydradb-claude-plugin",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Secure HydraDB automation for Claude Code with workspace sync, prompt recall, and conversation capture.",
   "author": "HydraDB <support@hydradb.com>",
   "license": "Apache-2.0",
