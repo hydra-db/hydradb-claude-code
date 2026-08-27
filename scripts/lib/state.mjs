@@ -130,7 +130,13 @@ export async function readState(dataDir) {
   }
 }
 
-export async function writeState(dataDir, state) {
+// `removedFilePaths` carries the tracked files this write intends to FORGET.
+// The `files` merge below re-reads what is on disk so a concurrent single-file
+// sync does not lose its addition, but a spread can only add or overwrite keys —
+// never drop one. Without an explicit removal list, a file deleted from the
+// in-memory state is resurrected from `current` on every write, so a deleted
+// source stays tracked forever and every full sync re-attempts its delete.
+export async function writeState(dataDir, state, { removedFilePaths = [] } = {}) {
   await ensureDataDir(dataDir);
   const statePath = path.join(dataDir, "state.json");
   const current = await readState(dataDir);
@@ -146,14 +152,19 @@ export async function writeState(dataDir, state) {
     })
   );
 
+  const files = {
+    ...(current.files || {}),
+    ...(state.files || {})
+  };
+  for (const filePath of removedFilePaths) {
+    delete files[filePath];
+  }
+
   const next = {
     ...cloneDefaultState(),
     ...current,
     ...state,
-    files: {
-      ...(current.files || {}),
-      ...(state.files || {})
-    },
+    files,
     sessions,
     lastSessionId: state.lastSessionId || current.lastSessionId || ""
   };

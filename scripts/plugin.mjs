@@ -26,6 +26,13 @@ async function pathExists(filePath) {
   }
 }
 
+// Tracked files a reconciling sync confirmed gone. writeState merges `files` with
+// what is on disk, so these have to be named explicitly or they come straight
+// back and the next sync tries to delete them again.
+function removedPaths(summary) {
+  return (summary?.deletedFiles || []).map((entry) => entry.filePath).filter(Boolean);
+}
+
 async function inferInlinePluginDataDir() {
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
   if (!pluginRoot) {
@@ -349,14 +356,14 @@ async function handleSessionSyncHook() {
     return;
   }
 
-  await syncWorkspace({
+  const syncSummary = await syncWorkspace({
     client,
     config: configResult.config,
     projectRoot: configResult.projectRoot,
     workspaceName: configResult.workspaceName,
     state
   });
-  await writeState(dataDir, state);
+  await writeState(dataDir, state, { removedFilePaths: removedPaths(syncSummary) });
 }
 
 async function handleUserPromptSubmit() {
@@ -842,7 +849,7 @@ async function handleSyncWorkspace(args) {
     state: runtime.state,
     force
   });
-  await writeState(runtime.dataDir, runtime.state);
+  await writeState(runtime.dataDir, runtime.state, { removedFilePaths: removedPaths(summary) });
 
   if (jsonMode) {
     emitJson(summary);

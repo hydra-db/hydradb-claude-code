@@ -1,5 +1,5 @@
 import { createHydraWrapper } from "./hydra/index.mjs";
-import { redactSecrets } from "./sanitize.mjs";
+import { redactSecrets, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -33,7 +33,7 @@ function extractChunkText(chunk) {
   }
 
   if (typeof chunk.chunk_content === "string") {
-    return chunk.chunk_content;
+    return unwrapAppKnowledgeEnvelope(chunk.chunk_content);
   }
 
   if (typeof chunk.text === "string") {
@@ -249,12 +249,14 @@ function sanitizeAdditionalContextMap(value) {
         );
         const chunkContent = trimText(
           redactSecrets(
-            entry.chunk_content ||
-              entry.chunk_text ||
-              entry.text ||
-              entry.content?.text ||
-              entry.content ||
-              ""
+            unwrapAppKnowledgeEnvelope(
+              entry.chunk_content ||
+                entry.chunk_text ||
+                entry.text ||
+                entry.content?.text ||
+                entry.content ||
+                ""
+            )
           )
         );
 

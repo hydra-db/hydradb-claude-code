@@ -72,6 +72,39 @@ assert.equal(normalizedRecall.chunks.length, 1);
 assert.equal(normalizedRecall.chunks[0].text, "HydraDB plugin overview");
 assert.equal(normalizedRecall.chunks[0].sourceTitle, "README.md");
 
+// Knowledge ingested via appKnowledge comes back as the whole stored envelope in
+// chunk_content. Recall must yield the prose, not the JSON scaffolding: injecting
+// the envelope spends the context budget on internal ids, empty format slots, and
+// duplicated metadata, and truncates the text it is meant to deliver.
+const envelopeRecall = normalizeRetrievalResponse({
+  chunks: [
+    {
+      chunk_uuid: "chunk-2",
+      source_title: "CLAUDE.md",
+      chunk_content: JSON.stringify({
+        id: "claude-file:abc123",
+        tenant_id: "db_test",
+        sub_tenant_id: "col_test",
+        title: "CLAUDE.md",
+        source: "claude-code-plugin",
+        content: { text: "# Smoke\nBuild with `make smoke`.", html_base64: "", files: [] },
+        tenant_metadata: { relative_path: "CLAUDE.md" },
+        app_metadata: { relative_path: "CLAUDE.md" }
+      })
+    }
+  ]
+});
+
+assert.equal(envelopeRecall.chunks[0].text, "# Smoke\nBuild with `make smoke`.");
+assert.ok(!envelopeRecall.chunks[0].text.includes("sub_tenant_id"), "envelope must not leak internal scope ids");
+assert.ok(!envelopeRecall.chunks[0].text.includes("html_base64"), "envelope must not leak empty format slots");
+
+// Content that merely looks JSON-ish is passed through untouched.
+const plainRecall = normalizeRetrievalResponse({
+  chunks: [{ chunk_uuid: "chunk-3", source_title: "n.md", chunk_content: '{"content": not json' }]
+});
+assert.equal(plainRecall.chunks[0].text, '{"content": not json');
+
 const tempDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-plugin-check-"));
 const baseEnv = {
   ...process.env,
@@ -121,6 +154,42 @@ await fs.writeFile(
   ),
   "utf8"
 );
+
+// writeState merges `files` with what is already on disk so a concurrent
+// single-file sync keeps its addition. That merge cannot express a removal, so a
+// forgotten file must be named explicitly — otherwise it is resurrected from disk
+// and every later full sync re-attempts a delete that can never settle.
+{
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-plugin-state-"));
+  const { readState, writeState } = await import("./lib/state.mjs");
+
+  const seeded = await readState(stateDir);
+  seeded.files["/w/a.md"] = { digest: "a", relPath: "a.md", target: "knowledge", chunkCount: 1 };
+  seeded.files["/w/b.md"] = { digest: "b", relPath: "b.md", target: "knowledge", chunkCount: 1 };
+  await writeState(stateDir, seeded);
+
+  const loaded = await readState(stateDir);
+  assert.deepEqual(Object.keys(loaded.files).sort(), ["/w/a.md", "/w/b.md"]);
+
+  // Dropping the key alone is not enough: the merge restores it from disk.
+  delete loaded.files["/w/b.md"];
+  await writeState(stateDir, loaded);
+  assert.deepEqual(
+    Object.keys((await readState(stateDir)).files).sort(),
+    ["/w/a.md", "/w/b.md"],
+    "merge-only write must not be able to forget a file"
+  );
+
+  // Naming the removal is what actually forgets it.
+  const withRemoval = await readState(stateDir);
+  delete withRemoval.files["/w/b.md"];
+  await writeState(stateDir, withRemoval, { removedFilePaths: ["/w/b.md"] });
+  assert.deepEqual(
+    Object.keys((await readState(stateDir)).files),
+    ["/w/a.md"],
+    "an explicitly removed file must not be resurrected"
+  );
+}
 
 const statusRaw = execFileSync(process.execPath, [path.join(root, "scripts/plugin.mjs"), "doctor", "--json"], {
   env: baseEnv,
