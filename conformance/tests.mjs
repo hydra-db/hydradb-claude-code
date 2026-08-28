@@ -202,7 +202,46 @@ export async function runHttpTests() {
         ["a", "b"],
         []
       ],
-      ["minimal success (no counts/results)", { success: true, data: {} }, ["a"], ["a"], []]
+      ["minimal success (no counts/results)", { success: true, data: {} }, ["a"], ["a"], []],
+      // An id the server has already removed reports deleted:false with a
+      // not-found error, under a success:false batch rollup. The postcondition
+      // ("id no longer stored") holds, so it is confirmed, not retried — without
+      // this a deleted file is retried on every full sync forever and its
+      // tracked state never clears. This is the exact prod response shape.
+      [
+        "already absent is terminal, not retryable",
+        {
+          success: false,
+          data: {
+            success: false,
+            message: "No sources were deleted",
+            results: [{ id: "gone", deleted: false, error: "Source not found" }],
+            deletedCount: 0
+          }
+        },
+        ["gone"],
+        ["gone"],
+        []
+      ],
+      // Per-item detail outranks the batch rollup: a real failure alongside an
+      // already-absent id must still be retained, even though both sit under the
+      // same success:false envelope.
+      [
+        "already absent + real failure under one rollup",
+        {
+          success: false,
+          data: {
+            success: false,
+            results: [
+              { id: "gone", deleted: false, error: "Source not found" },
+              { id: "boom", deleted: false, error: "internal error" }
+            ]
+          }
+        },
+        ["gone", "boom"],
+        ["gone"],
+        ["boom"]
+      ]
     ];
     for (const [label, envelope, ids, expDeleted, expFailed] of cases) {
       const res = await wrap(envelope).context.delete({ ids, kind: "knowledge" });

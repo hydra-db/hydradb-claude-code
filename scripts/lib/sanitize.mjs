@@ -50,3 +50,41 @@ export function redactSecrets(text) {
 export function wasRedacted(original, redacted) {
   return normalizeText(original) !== normalizeText(redacted);
 }
+
+// Knowledge sources are ingested through `appKnowledge`, which carries each item
+// as a structured envelope. The server indexes that envelope verbatim, so recall
+// returns the whole JSON object as the chunk's content — internal ids, empty
+// format slots, and duplicated metadata included, with the prose buried in
+// `content.text`. Injecting that raw would spend the context budget on scaffolding
+// and truncate the text it is supposed to deliver, so the envelope is unwrapped
+// back to its prose. Anything that is not one of our envelopes is returned as-is.
+export function unwrapAppKnowledgeEnvelope(text) {
+  if (typeof text !== "string") {
+    return "";
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.includes('"content"')) {
+    return text;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return text;
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return text;
+  }
+
+  const candidates = [parsed.content, parsed.content?.text, parsed.content?.markdown];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+
+  return text;
+}

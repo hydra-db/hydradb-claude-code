@@ -115,24 +115,43 @@ function isEnvelopeSuccessFalse(value) {
 // Counts are integers (0 = no match), so they are compared with `=== 0` / `>=`,
 // never `=== false`. This one classification subsumes all-success, all-fail,
 // partial/mixed, numeric-zero, per-item-error, and missing-field responses.
+// A per-item delete error meaning the id is already absent. Deletion is
+// idempotent: the caller's postcondition ("this id is no longer stored") holds,
+// so this is a terminal success, not a retryable failure. Without this, a source
+// the server already removed is retried on every full sync forever, and its
+// tracked state is never dropped.
+const ALREADY_ABSENT_ERROR = /not\s*found|does\s*not\s*exist|no\s*such|already\s*deleted/i;
+
+function isAlreadyAbsent(result) {
+  return typeof result?.error === "string" && ALREADY_ABSENT_ERROR.test(result.error);
+}
+
 function classifyDeletion(requestedIds, envelope, data) {
   const all = { deletedIds: [...requestedIds], failedIds: [] };
   const none = { deletedIds: [], failedIds: [...requestedIds] };
   if (!requestedIds.length) {
     return { deletedIds: [], failedIds: [] };
   }
-  if (isEnvelopeSuccessFalse(envelope) || data.success === false) {
-    return none;
-  }
+  // Per-item detail wins over the batch-level rollup. `success` is a rollup: the
+  // server reports success:false when ANY id in the batch was not deleted, which
+  // includes a batch whose ids were all already absent. Checking the rollup first
+  // would discard the per-item reasons that distinguish "failed" from "already
+  // gone", so the results array is classified before the rollup is consulted.
   if (Array.isArray(data.results)) {
-    // Per-item reporting is in use; confirm only ids explicitly deleted:true.
+    // Confirm ids explicitly deleted:true, plus ids the server reports as
+    // already absent — both leave the id not stored, which is what was asked.
     const confirmed = new Set(
-      data.results.filter((r) => r && r.deleted === true && r.id != null).map((r) => String(r.id))
+      data.results
+        .filter((r) => r && r.id != null && (r.deleted === true || isAlreadyAbsent(r)))
+        .map((r) => String(r.id))
     );
     return {
       deletedIds: requestedIds.filter((id) => confirmed.has(String(id))),
       failedIds: requestedIds.filter((id) => !confirmed.has(String(id)))
     };
+  }
+  if (isEnvelopeSuccessFalse(envelope) || data.success === false) {
+    return none;
   }
   // No per-item detail: fall back to the integer counts, all-or-none. A count
   // that covers every requested id (or the absence of any negative signal on an

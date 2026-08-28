@@ -1,4 +1,4 @@
-import { truncateText } from "./sanitize.mjs";
+import { truncateText, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 function safeString(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -57,7 +57,9 @@ function normalizeAdditionalContext(additionalContext, id) {
 
   const title = safeString(value.source_title || value.title || value.document_title || "Related context");
   const text = safeString(
-    value.chunk_content || value.chunk_text || value.text || value.content?.text || value.content
+    unwrapAppKnowledgeEnvelope(
+      value.chunk_content || value.chunk_text || value.text || value.content?.text || value.content
+    )
   );
 
   if (!title && !text) {
@@ -79,7 +81,12 @@ function relationsForChunk(result, chunk) {
   ).filter(Boolean);
 }
 
-function buildSection(label, result) {
+// Mirrors HydraDB's documented `buildContextString` reference formatter
+// (docs: essentials/v2/api-results): ENTITY PATHS, then per chunk a `Chunk N` /
+// `Source:` / text block followed by its Graph Relations and Extra Context, each
+// closed by `---`. This adds the MEMORY/KNOWLEDGE label the plugin needs to keep
+// two result sets apart, plus redaction and truncation the reference omits.
+export function buildContextString(label, result) {
   const lines = [];
 
   const paths = Array.isArray(result.graphContext?.queryPathsDetailed)
@@ -147,7 +154,7 @@ export function buildHydraContextBlock({ query, memory, knowledge, errors, maxCo
   const sections = [];
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {
-    const section = buildSection("MEMORY", memory);
+    const section = buildContextString("MEMORY", memory);
     if (section) {
       sections.push(section);
     }
@@ -158,7 +165,7 @@ export function buildHydraContextBlock({ query, memory, knowledge, errors, maxCo
     knowledge?.queryPaths?.length ||
     knowledge?.graphContext?.queryPathsDetailed?.length
   ) {
-    const section = buildSection("KNOWLEDGE", knowledge);
+    const section = buildContextString("KNOWLEDGE", knowledge);
     if (section) {
       sections.push(section);
     }

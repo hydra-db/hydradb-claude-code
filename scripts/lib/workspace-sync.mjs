@@ -534,7 +534,7 @@ export async function syncWorkspace({
         if (confirmed) {
           delete state.files[entry.filePath];
           summary.deleted += 1;
-          summary.deletedFiles.push({ path: entry.relPath, target: "memory", reason: entry.reason });
+          summary.deletedFiles.push({ path: entry.relPath, filePath: entry.filePath, target: "memory", reason: entry.reason });
         } else {
           summary.errors.push(`memory delete incomplete for ${entry.relPath}; retained for retry`);
         }
@@ -556,7 +556,7 @@ export async function syncWorkspace({
         if (deletedSet.has(entry.id)) {
           delete state.files[entry.filePath];
           summary.deleted += 1;
-          summary.deletedFiles.push({ path: entry.relPath, target: "knowledge", reason: entry.reason });
+          summary.deletedFiles.push({ path: entry.relPath, filePath: entry.filePath, target: "knowledge", reason: entry.reason });
         } else {
           summary.errors.push(`knowledge delete incomplete for ${entry.relPath}; retained for retry`);
         }
