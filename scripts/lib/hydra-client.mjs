@@ -478,6 +478,19 @@ export class HydraClient {
     return this._unifiedPromise;
   }
 
+  // The server names the rule when a split kind reaches a unified database
+  // ("type 'memory' is not valid on a unified database"). When the layout
+  // probe could not tell (it failed, or the database was not in the list it
+  // saw), that answer IS the layout: pin it and run the unified form once.
+  async _retryAsUnified(error, retry) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/unified database/i.test(message) && !(await this.isUnified())) {
+      this._unifiedPromise = Promise.resolve(true);
+      return retry();
+    }
+    throw error;
+  }
+
   // One ranked list over everything in a unified database (no corpus selector).
   async recallUnified(query, options = {}) {
     return normalizeRetrievalResponse(
@@ -504,6 +517,14 @@ export class HydraClient {
   }
 
   async recallMemories(query, options = {}) {
+    try {
+      return await this._recallMemories(query, options);
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.recallUnified(query, options));
+    }
+  }
+
+  async _recallMemories(query, options = {}) {
     return normalizeRetrievalResponse(
       await this._hydra.context.query(
         {
@@ -521,6 +542,14 @@ export class HydraClient {
   }
 
   async recallKnowledge(query, options = {}) {
+    try {
+      return await this._recallKnowledge(query, options);
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.recallUnified(query, options));
+    }
+  }
+
+  async _recallKnowledge(query, options = {}) {
     return normalizeRetrievalResponse(
       await this._hydra.context.query(
         {
@@ -545,14 +574,18 @@ export class HydraClient {
     }
     // The SDK carries memory items as a JSON string in the multipart `memories`
     // field; scope and type=memory are supplied by the wrapper.
-    return this._hydra.context.ingest(
-      {
-        kind: "memory",
-        memories: JSON.stringify(memories),
-        upsert: options.upsert ?? true
-      },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    try {
+      return await this._hydra.context.ingest(
+        {
+          kind: "memory",
+          memories: JSON.stringify(memories),
+          upsert: options.upsert ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+      );
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.addItems(memories.map(memoryToItem), options));
+    }
   }
 
   async addTextMemory(text, options = {}) {
@@ -623,10 +656,13 @@ export class HydraClient {
     if (!ids.length) {
       return { deletedIds: [], failedIds: [] };
     }
-    return this._hydra.context.delete(
-      { ids, kind: (await this.isUnified()) ? "unified" : "memory" },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    const timeoutMs = options.timeoutMs ?? this.writeTimeoutMs;
+    const kind = (await this.isUnified()) ? "unified" : "memory";
+    try {
+      return await this._hydra.context.delete({ ids, kind }, { timeoutMs });
+    } catch (error) {
+      return this._retryAsUnified(error, () => this._hydra.context.delete({ ids, kind: "unified" }, { timeoutMs }));
+    }
   }
 
   async deleteMemory(memoryId, options = {}) {
@@ -641,10 +677,15 @@ export class HydraClient {
     if (!knowledgeIds.length) {
       return { deletedIds: [], failedIds: [] };
     }
-    return this._hydra.context.delete(
-      { ids: knowledgeIds, kind: (await this.isUnified()) ? "unified" : "knowledge" },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    const timeoutMs = options.timeoutMs ?? this.writeTimeoutMs;
+    const kind = (await this.isUnified()) ? "unified" : "knowledge";
+    try {
+      return await this._hydra.context.delete({ ids: knowledgeIds, kind }, { timeoutMs });
+    } catch (error) {
+      return this._retryAsUnified(error, () =>
+        this._hydra.context.delete({ ids: knowledgeIds, kind: "unified" }, { timeoutMs })
+      );
+    }
   }
 }
 

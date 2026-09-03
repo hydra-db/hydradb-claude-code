@@ -237,8 +237,13 @@ export function createHydraWrapper({
     if (!response.ok) {
       throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`);
     }
-    return unwrapAndNormalize(parsed);
+    return parsed;
   }
+  // The generated client's REQUEST serializers reject `type: "unified"`
+  // before anything is sent (their enum predates PRO-1618), so every call
+  // that names that kind is built by hand. The wire is already snake_case,
+  // which is the shape the plugin normalises everything to anyway.
+  const unifiedKind = (args) => args.kind === "unified";
 
   function requestOptions(timeoutMs) {
     return { timeoutInSeconds: Math.max(1, Math.ceil(timeoutMs / 1000)), maxRetries: MAX_RETRIES };
@@ -267,6 +272,21 @@ export function createHydraWrapper({
   const context = {
     async query(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        return unwrapAndNormalize(
+          await rawJson("/query", "POST", "/query", {
+            ...contextScope(),
+            query: args.query,
+            type: "unified",
+            ...(args.operator ? { operator: args.operator } : {}),
+            ...(args.mode ? { mode: args.mode } : {}),
+            ...(args.maxResults != null ? { max_results: args.maxResults } : {}),
+            ...(args.alpha != null ? { alpha: args.alpha } : {}),
+            ...(args.recencyBias != null ? { recency_bias: args.recencyBias } : {}),
+            ...(args.graphContext != null ? { graph_context: args.graphContext } : {})
+          }, timeoutMs)
+        );
+      }
       const request = {
         ...contextScope(),
         query: args.query,
@@ -289,11 +309,13 @@ export function createHydraWrapper({
         // The unified shape (PRO-1618): items[], each text or a conversation,
         // no corpus selector. On a split database they land in the memory
         // corpus; on a unified database they are the only shape accepted.
-        return rawJson("/context/ingest", "POST", "/context/ingest", {
-          ...contextScope(),
-          items: args.items,
-          ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {})
-        }, timeoutMs);
+        return unwrapAndNormalize(
+          await rawJson("/context/ingest", "POST", "/context/ingest", {
+            ...contextScope(),
+            items: args.items,
+            ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {})
+          }, timeoutMs)
+        );
       }
       // Ingest carries a top-level tenant_id (one of the DX-G-002 defects) and
       // the SAME canonical `collection` that delete uses, so an ingest and a
@@ -319,6 +341,11 @@ export function createHydraWrapper({
 
     async list(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        return unwrapAndNormalize(
+          await rawJson("/context/list", "POST", "/context/list", { ...contextScope(), type: "unified" }, timeoutMs)
+        );
+      }
       const request = { ...contextScope(), ...(args.kind ? { type: args.kind } : {}) };
       return unwrapAndNormalize(
         await call("/context/list", timeoutMs, () => client.context.list(request, requestOptions(timeoutMs)))
@@ -344,6 +371,12 @@ export function createHydraWrapper({
 
     async relations(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        const params = new URLSearchParams({ ...contextScope(), type: "unified", ...(args.id ? { id: args.id } : {}) });
+        return unwrapAndNormalize(
+          await rawJson("/context/relations", "GET", `/context/relations?${params.toString()}`, undefined, timeoutMs)
+        );
+      }
       const request = { ...contextScope(), ...(args.id ? { id: args.id } : {}) };
       return unwrapAndNormalize(
         await call("/context/relations", timeoutMs, () => client.context.relations(request, requestOptions(timeoutMs)))
@@ -365,9 +398,9 @@ export function createHydraWrapper({
         ids: args.ids,
         ...(args.kind ? { type: args.kind } : {})
       };
-      const envelope = await call("/context (delete)", timeoutMs, () =>
-        client.context.delete(request, requestOptions(timeoutMs))
-      );
+      const envelope = unifiedKind(args)
+        ? await rawJson("/context (delete)", "DELETE", "/context", request, timeoutMs)
+        : await call("/context (delete)", timeoutMs, () => client.context.delete(request, requestOptions(timeoutMs)));
       const data = unwrapAndNormalize(envelope) ?? {};
       const { deletedIds, failedIds } = classifyDeletion(requestedIds, envelope, data);
       return { deletedIds, failedIds, data };
@@ -382,11 +415,13 @@ export function createHydraWrapper({
       if (args.type != null) {
         // `type` (split|unified) is dropped by the vendored SDK's serializer,
         // which would provision a split database in silence.
-        return rawJson("/databases (create)", "POST", "/databases", {
-          database: args.database,
-          type: args.type,
-          ...(args.extra || {})
-        }, timeoutMs);
+        return unwrapAndNormalize(
+          await rawJson("/databases (create)", "POST", "/databases", {
+            database: args.database,
+            type: args.type,
+            ...(args.extra || {})
+          }, timeoutMs)
+        );
       }
       const request = { database: args.database, ...(args.extra || {}) };
       return unwrapAndNormalize(
@@ -413,6 +448,7 @@ export function createHydraWrapper({
       if (!layoutsPromise) {
         const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
         layoutsPromise = rawJson("/databases", "GET", "/databases", undefined, timeoutMs)
+          .then((envelope) => unwrapAndNormalize(envelope))
           .then((listed) => {
             const map = new Map();
             for (const row of Array.isArray(listed?.details) ? listed.details : []) {

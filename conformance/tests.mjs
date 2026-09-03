@@ -16,10 +16,13 @@ import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-cl
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
 
 function fakeResponse(payload) {
-  const text = JSON.stringify(payload);
+  // A responder may name the HTTP status through `__status` (default 200),
+  // so a wire test can make the server refuse a request the way it really does.
+  const { __status: status = 200, ...body } = payload && typeof payload === "object" ? payload : {};
+  const text = JSON.stringify(payload && typeof payload === "object" ? body : payload);
   return {
-    ok: true,
-    status: 200,
+    ok: status < 400,
+    status,
     headers: {
       get: (name) => (String(name).toLowerCase() === "content-type" ? "application/json" : null),
       has: () => false,
@@ -331,7 +334,96 @@ export async function runHttpTests() {
     assert.equal(inspect.chunk_content, "body");
   }
 
-  return { tests: 9 };
+  // 10) PRO-1618: unified recall is a hand-built POST /query with type=unified
+  //     (the vendored SDK's request serializer rejects the value), and the
+  //     result goes through the same snake_case seam.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, () => ({
+        data: { chunks: [{ chunk_uuid: "c1", chunk_content: "body", source_title: "T" }] },
+        success: true
+      }))
+    });
+    const res = await client.recallUnified("acme");
+    const req = sink.at(-1);
+    assert.equal(req.path, "/query");
+    assert.equal(req.httpMethod, "POST");
+    assert.equal(req.contentType, "application/json");
+    const body = JSON.parse(req.bodyString);
+    assert.equal(body.type, "unified");
+    assert.equal(body.database, "db_test");
+    assert.equal(body.collection, "col_test");
+    assert.equal(res.chunks[0].text, "body");
+  }
+
+  // 11) Unified delete is a hand-built DELETE /context with type=unified, and
+  //     the per-id classification still sees the envelope.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, () => ({ data: { deleted_count: 1 }, success: true }))
+    });
+    const result = await client._hydra.context.delete({ ids: ["item-1"], kind: "unified" });
+    const req = sink.at(-1);
+    assert.equal(req.path, "/context");
+    assert.equal(req.httpMethod, "DELETE");
+    const body = JSON.parse(req.bodyString);
+    assert.equal(body.type, "unified");
+    assert.deepEqual(body.ids, ["item-1"]);
+    assert.deepEqual(result.deletedIds, ["item-1"]);
+  }
+
+  // 12) On a unified database every memory write becomes the items[] JSON
+  //     body after one layout probe; the split-era `memories` field is never sent.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
+          : { data: { success_count: 1, failed_count: 0 }, success: true }
+      )
+    });
+    await client.addMemories([{ text: "the user prefers dark mode", infer: true, source_id: "m1" }]);
+    assert.equal(sink[0].path, "/databases", "the layout is probed once, first");
+    const req = sink.at(-1);
+    assert.equal(req.path, "/context/ingest");
+    assert.equal(req.contentType, "application/json", "unified ingest is the JSON items[] body");
+    const body = JSON.parse(req.bodyString);
+    assert.deepEqual(body.items, [{ text: "the user prefers dark mode", context_id: "m1", enrich: true }]);
+    assert.ok(!("memories" in body));
+  }
+
+  // 13) A probe that fails reads as split, and when the server then names the
+  //     rule the client pins unified and retries once.
+  {
+    const sink = [];
+    let calls = 0;
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        calls += 1;
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        if (req.path === "/context/ingest" && req.contentType === "multipart/form-data") {
+          return {
+            __status: 400,
+            success: false,
+            error: { code: "VALIDATION_ERROR", message: "type 'memory' is not valid on a unified database" }
+          };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await client.addMemories([{ text: "note" }]);
+    assert.equal(sink.at(-1).contentType, "application/json", "retried as the unified items[] body");
+    assert.equal(await client.isUnified(), true, "the refusal pins the layout for later calls");
+  }
+
+  return { tests: 13 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
