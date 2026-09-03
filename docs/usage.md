@@ -128,6 +128,9 @@ Use this when you want automatic recall and sync, but no automatic memory writes
 - `memory`: recall memories only
 - `both`: recall memories and knowledge in parallel
 - `knowledge`: recall knowledge only
+- `unified` / `auto`: explicit spellings; `auto` means `memory` on a split database
+
+On a unified database (created with `type: "unified"`, see `hydradb-api-info/unified-databases.md`) this knob is ignored: there is one corpus, and the plugin recalls it as a single `CONTEXT` section and ingests everything through the unified `items[]` body. The layout is read once from `GET /databases`.
 
 ### `ingestionMode`
 
