@@ -201,6 +201,45 @@ export function createHydraWrapper({
     }
   }
 
+  // PRO-1618: the vendored SDK predates `items` on ingest, `type` on database
+  // create and `details[]` on the database list, and it drops fields it does
+  // not know. Those three calls go over the wire by hand, through the same
+  // envelope unwrap and error translation, until the SDK is regenerated.
+  const rawFetch = fetchImpl ?? globalThis.fetch;
+  const rawBase = baseUrl.replace(/\/+$/g, "");
+  async function rawJson(label, method, path, body, timeoutMs) {
+    let response;
+    try {
+      response = await rawFetch(`${rawBase}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          // CONTRACT S2 rule 6: every v2 call names its version.
+          "API-Version": "2"
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        throw new HydraWrapperError(`${label} timed out after ${timeoutMs}ms`);
+      }
+      throw translateError(error, label, timeoutMs);
+    }
+    const text = await response.text().catch(() => "");
+    let parsed = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+    if (!response.ok) {
+      throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`);
+    }
+    return unwrapAndNormalize(parsed);
+  }
+
   function requestOptions(timeoutMs) {
     return { timeoutInSeconds: Math.max(1, Math.ceil(timeoutMs / 1000)), maxRetries: MAX_RETRIES };
   }
@@ -246,6 +285,16 @@ export function createHydraWrapper({
 
     async ingest(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
+      if (args.items != null) {
+        // The unified shape (PRO-1618): items[], each text or a conversation,
+        // no corpus selector. On a split database they land in the memory
+        // corpus; on a unified database they are the only shape accepted.
+        return rawJson("/context/ingest", "POST", "/context/ingest", {
+          ...contextScope(),
+          items: args.items,
+          ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {})
+        }, timeoutMs);
+      }
       // Ingest carries a top-level tenant_id (one of the DX-G-002 defects) and
       // the SAME canonical `collection` that delete uses, so an ingest and a
       // later delete resolve to the identical scope (the server filters delete
@@ -326,9 +375,19 @@ export function createHydraWrapper({
   };
 
   // databases.* operate on an explicit target database, not the configured scope.
+  let layoutsPromise = null;
   const databases = {
     async create(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
+      if (args.type != null) {
+        // `type` (split|unified) is dropped by the vendored SDK's serializer,
+        // which would provision a split database in silence.
+        return rawJson("/databases (create)", "POST", "/databases", {
+          database: args.database,
+          type: args.type,
+          ...(args.extra || {})
+        }, timeoutMs);
+      }
       const request = { database: args.database, ...(args.extra || {}) };
       return unwrapAndNormalize(
         await call("/databases (create)", timeoutMs, () => client.databases.create(request, requestOptions(timeoutMs)))
@@ -347,6 +406,38 @@ export function createHydraWrapper({
       return unwrapAndNormalize(
         await call("/databases", timeoutMs, () => client.databases.list(requestOptions(timeoutMs)))
       );
+    },
+    // Every database this key can see, mapped to its storage layout (PRO-1618),
+    // from GET /databases details[]. Memoised: a layout is fixed at creation.
+    async layouts(opts = {}) {
+      if (!layoutsPromise) {
+        const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+        layoutsPromise = rawJson("/databases", "GET", "/databases", undefined, timeoutMs)
+          .then((listed) => {
+            const map = new Map();
+            for (const row of Array.isArray(listed?.details) ? listed.details : []) {
+              if (row && row.database) {
+                map.set(String(row.database), row.type === "unified" ? "unified" : "split");
+              }
+            }
+            return map;
+          })
+          .catch((error) => {
+            layoutsPromise = null;
+            throw error;
+          });
+      }
+      return layoutsPromise;
+    },
+    // The layout of one database. Unknown, or a failed probe, reads as split:
+    // the layout of every database created before PRO-1618, so the worst case
+    // is the old default, never a wrong unified call.
+    async layout(database, opts = {}) {
+      try {
+        return (await databases.layouts(opts)).get(database) ?? "split";
+      } catch {
+        return "split";
+      }
     },
     async collections(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;

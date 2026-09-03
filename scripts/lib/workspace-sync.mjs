@@ -154,7 +154,9 @@ function splitIntoChunks(text, maxChars) {
 }
 
 function chooseIngestionTarget(config, chunkCount) {
-  if (config.ingestionMode === "memory") {
+  if (config.ingestionMode === "memory" || config.ingestionMode === "unified") {
+    // `unified` is the memory-shaped path; on a unified database the client
+    // sends it as items[] regardless of which target is chosen here.
     return "memory";
   }
 

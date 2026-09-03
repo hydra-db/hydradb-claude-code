@@ -367,6 +367,72 @@ export function normalizeRetrievalResponse(response) {
   };
 }
 
+// PRO-1618: the unified item shape. One memory-shaped record becomes one item
+// (text or a role/content conversation); the field names are the ones the
+// redesign settled on. Exported so the check script can pin the mapping.
+export function memoryToItem(memory) {
+  const item = {};
+  if (memory.text != null) {
+    item.text = memory.text;
+  }
+  if (Array.isArray(memory.user_assistant_pairs)) {
+    item.conversation = memory.user_assistant_pairs.flatMap((pair) => [
+      { role: "user", content: pair.user, ...(memory.user_name ? { name: memory.user_name } : {}) },
+      { role: "assistant", content: pair.assistant }
+    ]);
+  }
+  if (memory.source_id) {
+    item.context_id = memory.source_id;
+  }
+  if (memory.title) {
+    item.title = memory.title;
+  }
+  item.enrich = memory.infer ?? true;
+  if (item.enrich && memory.custom_instructions) {
+    item.custom_instructions = memory.custom_instructions;
+  }
+  if (memory.tenant_metadata != null) {
+    item.attributes = parseMaybeJson(memory.tenant_metadata);
+  }
+  if (memory.document_metadata != null) {
+    item.custom_attributes = parseMaybeJson(memory.document_metadata);
+  }
+  return item;
+}
+
+// A structured app-knowledge record (the workspace sync's knowledge target) as
+// a unified item: the text is the body, the client-assigned id is kept.
+export function appKnowledgeToItem(record) {
+  const item = {
+    text: record?.content?.text ?? record?.text ?? "",
+    enrich: record?.infer ?? true
+  };
+  if (record?.id) {
+    item.context_id = record.id;
+  }
+  if (record?.title) {
+    item.title = record.title;
+  }
+  if (record?.tenant_metadata != null) {
+    item.attributes = parseMaybeJson(record.tenant_metadata);
+  }
+  if (record?.app_metadata != null) {
+    item.custom_attributes = parseMaybeJson(record.app_metadata);
+  }
+  return item;
+}
+
+function parseMaybeJson(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
+  }
+}
+
 export class HydraClient {
   constructor({
     apiKey,
@@ -397,6 +463,44 @@ export class HydraClient {
       ...(fetchImpl ? { fetch: fetchImpl } : {}),
       ...(sdkClient ? { sdkClient } : {})
     });
+  }
+
+  // PRO-1618: whether the configured database keeps one corpus. Resolved once
+  // per process from GET /databases; a failed probe reads as split, so every
+  // existing configuration behaves exactly as before.
+  async isUnified() {
+    if (!this._unifiedPromise) {
+      this._unifiedPromise = this._hydra.databases
+        .layout(this.tenantId)
+        .then((layout) => layout === "unified")
+        .catch(() => false);
+    }
+    return this._unifiedPromise;
+  }
+
+  // One ranked list over everything in a unified database (no corpus selector).
+  async recallUnified(query, options = {}) {
+    return normalizeRetrievalResponse(
+      await this._hydra.context.query(
+        {
+          query,
+          kind: "unified",
+          mode: options.mode || "fast",
+          maxResults: options.maxResults || 6,
+          alpha: 0.8,
+          recencyBias: options.recencyBias ?? 0,
+          graphContext: options.graphContext ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
+      )
+    );
+  }
+
+  async addItems(items, options = {}) {
+    return this._hydra.context.ingest(
+      { items, upsert: options.upsert ?? true },
+      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+    );
   }
 
   async recallMemories(query, options = {}) {
@@ -434,6 +538,11 @@ export class HydraClient {
   }
 
   async addMemories(memories, options = {}) {
+    if (await this.isUnified()) {
+      // A unified database refuses the split-era `memories` field; the same
+      // records go as items[] and land in the one corpus.
+      return this.addItems(memories.map(memoryToItem), options);
+    }
     // The SDK carries memory items as a JSON string in the multipart `memories`
     // field; scope and type=memory are supplied by the wrapper.
     return this._hydra.context.ingest(
@@ -487,6 +596,9 @@ export class HydraClient {
   }
 
   async uploadKnowledge(appKnowledge) {
+    if (await this.isUnified()) {
+      return this.addItems((appKnowledge || []).map(appKnowledgeToItem), { upsert: true });
+    }
     // DX-G-002 fix: knowledge ingests via the SDK's multipart context.ingest,
     // carrying the structured items in `appKnowledge` (a JSON string). That is
     // multipart with a top-level tenant_id and preserves each item's
@@ -512,7 +624,7 @@ export class HydraClient {
       return { deletedIds: [], failedIds: [] };
     }
     return this._hydra.context.delete(
-      { ids, kind: "memory" },
+      { ids, kind: (await this.isUnified()) ? "unified" : "memory" },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
   }
@@ -530,7 +642,7 @@ export class HydraClient {
       return { deletedIds: [], failedIds: [] };
     }
     return this._hydra.context.delete(
-      { ids: knowledgeIds, kind: "knowledge" },
+      { ids: knowledgeIds, kind: (await this.isUnified()) ? "unified" : "knowledge" },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
   }

@@ -224,7 +224,38 @@ function sessionMemorySourceId(sessionId) {
   return `claude-session:${sessionId}:memory`;
 }
 
+const EMPTY_RECALL = { chunks: [], queryPaths: [], graphContext: {}, additionalContext: {} };
+
+// PRO-1618: the recall mode actually used. A unified database has one corpus
+// and refuses memory/knowledge, so it always recalls as `unified`; `auto`
+// means memory on a split database (the old default).
+async function resolveSearchMode(client, config) {
+  if (await client.isUnified()) {
+    return "unified";
+  }
+  return config.searchMode === "auto" || config.searchMode === "unified" ? "memory" : config.searchMode;
+}
+
 async function performRecall(client, config, query) {
+  const searchMode = await resolveSearchMode(client, config);
+  if (searchMode === "unified") {
+    const settled = await Promise.allSettled([
+      client.recallUnified(query, {
+        maxResults: config.maxMemoryResults + config.maxKnowledgeResults,
+        mode: config.recallMode,
+        graphContext: config.graphContext
+      })
+    ]);
+    const unified = settled[0];
+    return {
+      searchMode,
+      unified: unified.status === "fulfilled" ? unified.value : EMPTY_RECALL,
+      memory: EMPTY_RECALL,
+      knowledge: EMPTY_RECALL,
+      errors: combineRecallErrors([unified])
+    };
+  }
+  config = { ...config, searchMode };
   const tasks = [];
 
   if (config.searchMode === "memory" || config.searchMode === "both") {
@@ -445,6 +476,7 @@ async function handleUserPromptSubmit() {
 
   const additionalContext = buildHydraContextBlock({
     query: prompt,
+    unified: recall.unified,
     memory: recall.memory,
     knowledge: recall.knowledge,
     errors: recall.errors,
@@ -771,6 +803,17 @@ async function handleSaveSession(args) {
 
 function renderRecallText(result) {
   const lines = [];
+
+  if (result.searchMode === "unified") {
+    lines.push("Context:");
+    if (result.unified?.chunks?.length) {
+      for (const chunk of result.unified.chunks) {
+        lines.push(`- ${chunk.title || "Item"}: ${chunk.text}`);
+      }
+    } else {
+      lines.push("- none");
+    }
+  }
 
   if (result.searchMode === "memory" || result.searchMode === "both") {
     lines.push("Memories:");
