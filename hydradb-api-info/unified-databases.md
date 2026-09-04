@@ -41,4 +41,10 @@ POST /context/ingest
 
 A workspace file's `metadata` becomes `attributes` and its `additional_metadata` becomes `custom_attributes`; `timestamp` becomes `happened_at`. `source`, `description` and `url` have no field of their own on an item, so they ride in `custom_attributes` rather than being dropped — a synced file keeps the same provenance it has on a split database.
 
+## What an item cannot carry yet
+
+`items[]` has no `is_markdown`, and it accepts a speaker `name` only on a conversation turn, never on a text item. Both are set by the workspace sync on every memory chunk, and both change what the server does with the content: `is_markdown` changes how the body is chunked and rendered, `user_name` is the attribution.
+
+So the client REFUSES those two rather than dropping them. A workspace sync that would send a markdown file through the memory lane on a unified database fails with a message naming the field, instead of quietly ingesting the same file differently than it would on a split database. Until the server accepts `is_markdown` on an item, sync markdown workspace files on a split database, or set `ingestionMode: "knowledge"` so they go through the knowledge lane, which has no such flag.
+
 `searchMode: "unified"` and `ingestionMode: "unified"` are accepted as explicit spellings, and `searchMode: "auto"` means `memory` on a split database; the layout always wins.
