@@ -15,6 +15,7 @@ import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import {
   appKnowledgeToItem,
   HydraClient,
+  isUnifiedLayoutRefusal,
   memoryToItem,
   normalizeRetrievalResponse
 } from "../scripts/lib/hydra-client.mjs";
@@ -476,7 +477,7 @@ export async function runHttpTests() {
             __status: 400,
             success: false,
             error: {
-              code: "UNIFIED_DATABASE",
+              code: "CORPUS_TYPE_UNSUPPORTED",
               message:
                 "this database is unified: send the content as `items` (a JSON array of text or conversation items)"
             }
@@ -555,23 +556,69 @@ export async function runHttpTests() {
     });
   }
 
-  // 13f) A field items[] has no home for is REFUSED, never dropped: is_markdown
-  //      changes how the server chunks and renders, and user_name on a text item
-  //      is the attribution. Both are set on every workspace memory chunk.
+  // 13f) is_markdown and user_name are CARRIED, not dropped: the first changes
+  //      how the server chunks and renders, the second is the attribution, and
+  //      buildMemoryItems sets both on every workspace memory chunk.
   {
-    assert.throws(() => memoryToItem({ text: "# Title", is_markdown: true }), /is_markdown/);
-    assert.throws(() => memoryToItem({ text: "note", user_name: "Ada" }), /user_name/);
-    // A conversation DOES have a home for it, as the per-turn speaker name.
-    assert.deepEqual(
-      memoryToItem({ user_assistant_pairs: [{ user: "hi", assistant: "yo" }], user_name: "Ada" }).conversation,
-      [
-        { role: "user", content: "hi", name: "Ada" },
-        { role: "assistant", content: "yo" }
-      ]
+    assert.deepEqual(memoryToItem({ text: "# Title", is_markdown: true, user_name: "Ada" }), {
+      text: "# Title",
+      is_markdown: true,
+      user_name: "Ada",
+      enrich: true
+    });
+    assert.equal(
+      memoryToItem({ text: "note", is_markdown: false }).is_markdown,
+      false,
+      "an explicit false is still the caller's answer, not an absent field"
+    );
+    // A conversation's attribution rides on the per-turn speaker name instead.
+    const conversationItem = memoryToItem({
+      user_assistant_pairs: [{ user: "hi", assistant: "yo" }],
+      user_name: "Ada"
+    });
+    assert.deepEqual(conversationItem.conversation, [
+      { role: "user", content: "hi", name: "Ada" },
+      { role: "assistant", content: "yo" }
+    ]);
+    assert.ok(!("user_name" in conversationItem), "a conversation does not repeat it at item level");
+  }
+
+  // 13g) CORPUS_TYPE_UNSUPPORTED covers three refusals and only one is ours.
+  //      `unified` sent to a SPLIT database carries the same code; retrying it
+  //      as unified would turn a clear 400 into a second, more confusing one.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "split" }] }, success: true }
+          : {
+              __status: 400,
+              success: false,
+              error: {
+                code: "CORPUS_TYPE_UNSUPPORTED",
+                message:
+                  'type "unified" is only valid on a unified database; this database stores knowledge and memory separately'
+              }
+            }
+      )
+    });
+    await assert.rejects(
+      () => client.recallUnified("acme"),
+      /only valid on a unified database/,
+      "the sibling refusal propagates rather than being retried"
+    );
+    const queries = sink.filter((req) => req.path === "/query");
+    assert.equal(queries.length, 1, "no retry: this refusal is not ours");
+    // And the third sibling: `all` on an ingest is a bad value, not a layout answer.
+    assert.equal(
+      isUnifiedLayoutRefusal(new Error("unified ingest failed with 400: invalid type 'all': it selects both corpora")),
+      false
     );
   }
 
-  return { tests: 18 };
+  return { tests: 19 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

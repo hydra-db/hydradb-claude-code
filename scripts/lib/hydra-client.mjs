@@ -367,31 +367,39 @@ export function normalizeRetrievalResponse(response) {
   };
 }
 
-// PRO-1618: the server's machine-readable code for "you sent a split-era
-// `type` to a unified database". Preferred over the message text because the
-// refusal is worded differently depending on which validator answers.
-export const UNIFIED_LAYOUT_ERROR_CODE = "UNIFIED_DATABASE";
+// PRO-1618: the server's machine-readable code for a `type` the addressed
+// database does not accept (hydradb-application #870, handler/errors.go). It
+// names the FAMILY, not the member: the same code covers knowledge/memory on a
+// unified database, `unified` on a split one, and `all` on an ingest. Only the
+// first of those is ours to retry, so the code narrows and the message decides.
+export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
 
-// The message fallback, for a server that does not send the code yet. It has to
-// cover BOTH phrasings the server uses:
+// The two siblings under that code, excluded first. Both name a unified
+// database while telling you this one is SPLIT, or that the value is wrong
+// whatever the layout; retrying either as unified turns a clear 400 into a
+// second, more confusing one.
+const OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i;
+
+// The wording of the refusal that IS ours, for a server that sends no code (an
+// older build, a proxy that ate the envelope). Two validators answer it:
 //
 //   corpus type validator: `type "memory" is not valid on a unified database: …`
 //   ingest body validator: `this database is unified: send the content as …`
 //
-// and must NOT match the mirror-image refusals, which name a unified database
-// while telling you the database is SPLIT ("type \"unified\" is only valid on a
-// unified database…", "context_category is only supported on a unified
-// database… This database is split"). Retrying those as unified would turn a
-// clear 400 into a second, more confusing one.
+// The server treats this text as a contract precisely because clients match on
+// it, so it stays as the fallback rather than being deleted once the code ships.
 const UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
 
 // Whether an error is the server refusing a split-era `type` on a unified
-// database. Exported so the conformance tests pin both branches.
+// database. Exported so the conformance tests pin every branch.
 export function isUnifiedLayoutRefusal(error) {
-  if (error?.errorCode === UNIFIED_LAYOUT_ERROR_CODE) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (OTHER_CORPUS_REFUSAL_RE.test(message)) {
+    return false;
+  }
+  if (error?.errorCode === CORPUS_TYPE_UNSUPPORTED_CODE) {
     return true;
   }
-  const message = error instanceof Error ? error.message : String(error);
   return UNIFIED_LAYOUT_REFUSAL_RE.test(message);
 }
 
@@ -399,11 +407,12 @@ export function isUnifiedLayoutRefusal(error) {
 // (text or a role/content conversation); the field names are the ones the
 // redesign settled on. Exported so the check script can pin the mapping.
 //
-// A field the split lane carried but items[] has no home for is REFUSED here,
-// never dropped. Dropping is the worse failure: `is_markdown` changes how the
-// server chunks and renders the body, and `user_name` is the attribution on the
-// memory, so a silent drop makes the same file ingest differently depending on
-// the database's layout, with nothing in the output to say so.
+// `is_markdown` and `user_name` are carried, not dropped: `is_markdown` changes
+// how the server chunks and renders the body and `user_name` is the
+// attribution, so losing either would make the same file ingest differently
+// depending on the database's layout with nothing in the output to say so.
+// MemoryItem has always had both; items[] gained them in hydradb-application
+// #870.
 export function memoryToItem(memory) {
   const item = {};
   const conversation = Array.isArray(memory.user_assistant_pairs)
@@ -420,19 +429,13 @@ export function memoryToItem(memory) {
       { role: "assistant", content: pair.assistant }
     ]);
   }
-  if (memory.is_markdown) {
-    throw new Error(
-      "unified ingest cannot carry is_markdown: items[] has no equivalent field, and " +
-        "dropping it would change how the body is chunked and rendered. Ingest this " +
-        "content on a split database, or wait for is_markdown on the unified items[] body."
-    );
+  if (memory.is_markdown != null) {
+    item.is_markdown = memory.is_markdown;
   }
+  // A conversation's attribution rides on the per-turn `name` above, which is
+  // what the server reads first; only a text item needs the item-level field.
   if (!conversation && memory.user_name) {
-    throw new Error(
-      "unified ingest cannot carry user_name on a text item: items[] accepts a speaker " +
-        "`name` only on conversation turns. Send this as a conversation, or drop user_name " +
-        "from the record explicitly rather than losing the attribution silently."
-    );
+    item.user_name = memory.user_name;
   }
   if (memory.source_id) {
     item.context_id = memory.source_id;
