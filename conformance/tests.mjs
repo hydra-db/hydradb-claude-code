@@ -622,6 +622,29 @@ export async function runHttpTests() {
     );
     badType.errorCode = "CORPUS_TYPE_UNSUPPORTED";
     assert.equal(isUnifiedLayoutRefusal(badType), false, "a typo'd type is not a layout answer");
+    // The `all`-on-ingest advice is layout-aware and now says "This database is
+    // unified, so send 'unified'…" inside a refusal that is NOT ours. Excluding
+    // on `invalid type` BEFORE reading the code is what keeps that sentence
+    // from being read as a layout answer — this pins that ordering.
+    const allOnUnified = new Error(
+      "unified ingest failed with 400: invalid type 'all': it selects both corpora for reads and " +
+        "deletes, but an ingest must name the one it writes to. This database is unified, so send " +
+        "'unified' or omit `type` entirely."
+    );
+    allOnUnified.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(
+      isUnifiedLayoutRefusal(allOnUnified),
+      false,
+      "the advice clause names a unified database but the refusal is still not ours"
+    );
+    // items[] with type=knowledge is a caller error, not a layout answer, and a
+    // retry that pinned unified would strand a SPLIT database on it.
+    const itemsWithKnowledge = new Error(
+      "unified ingest failed with 400: items cannot be combined with type=knowledge: items are " +
+        "memory-shaped (text or a conversation); omit type or use the unified default."
+    );
+    itemsWithKnowledge.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(itemsWithKnowledge), false);
     // The code is read from `detail.error_code` as well as `error.code`.
     const viaDetail = new Error("ingest failed with 400: the corpus refused this request");
     viaDetail.errorCode = "CORPUS_TYPE_UNSUPPORTED";
