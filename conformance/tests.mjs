@@ -12,7 +12,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
-import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
+import {
+  appKnowledgeToItem,
+  HydraClient,
+  memoryToItem,
+  normalizeRetrievalResponse
+} from "../scripts/lib/hydra-client.mjs";
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
 
 function fakeResponse(payload) {
@@ -423,7 +428,150 @@ export async function runHttpTests() {
     assert.equal(await client.isUnified(), true, "the refusal pins the layout for later calls");
   }
 
-  return { tests: 13 };
+  // 13b) The SAME recovery for the knowledge lane. uploadKnowledge was the one
+  //      layout-sensitive write with no try/catch, so a flaky layout probe left
+  //      every workspace file in the knowledge lane 400ing for the life of the
+  //      process while the memory lane in the same sync recovered.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        if (req.path === "/context/ingest" && req.contentType === "multipart/form-data") {
+          return {
+            __status: 400,
+            success: false,
+            error: { code: "VALIDATION_ERROR", message: "type 'knowledge' is not valid on a unified database" }
+          };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await client.uploadKnowledge([
+      { id: "claude-file:a", title: "CLAUDE.md", content: { text: "# Smoke" } }
+    ]);
+    const req = sink.at(-1);
+    assert.equal(req.contentType, "application/json", "knowledge retries as the unified items[] body too");
+    assert.deepEqual(JSON.parse(req.bodyString).items, [
+      { text: "# Smoke", enrich: true, context_id: "claude-file:a", title: "CLAUDE.md" }
+    ]);
+    assert.equal(await client.isUnified(), true, "the knowledge refusal pins the layout too");
+  }
+
+  // 13c) The ingest-body wording of the same refusal ("this database is
+  //      unified: send the content as `items`") is the one the old
+  //      /unified database/i pattern missed entirely, and the retry is pinned
+  //      only once it has actually succeeded.
+  {
+    const sink = [];
+    let ingests = 0;
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        ingests += 1;
+        if (ingests === 1) {
+          return {
+            __status: 400,
+            success: false,
+            error: {
+              code: "UNIFIED_DATABASE",
+              message:
+                "this database is unified: send the content as `items` (a JSON array of text or conversation items)"
+            }
+          };
+        }
+        if (ingests === 2) {
+          return { __status: 503, success: false, error: { message: "upstream unavailable" } };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await assert.rejects(
+      () => client.addMemories([{ text: "note" }]),
+      /503/,
+      "a retry that fails for an unrelated reason propagates that failure"
+    );
+    assert.equal(
+      await client.isUnified(),
+      false,
+      "and must NOT pin the layout: the retry never proved the database is unified"
+    );
+  }
+
+  // 13d) A knowledge record with no text is dropped rather than sent: server
+  //      validation is per item but all-or-nothing per request, so one empty
+  //      record would 400 the whole batch where the split lane stored it.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
+          : { data: { success_count: 1, failed_count: 0 }, success: true }
+      )
+    });
+    await client.uploadKnowledge([
+      { id: "claude-file:empty", title: "EMPTY.md", content: { text: "   " } },
+      { id: "claude-file:real", title: "CLAUDE.md", content: { text: "# Smoke" } }
+    ]);
+    const items = JSON.parse(sink.at(-1).bodyString).items;
+    assert.equal(items.length, 1, "the empty record is skipped, not sent");
+    assert.equal(items[0].context_id, "claude-file:real");
+  }
+
+  // 13e) The workspace-sync knowledge record keeps everything its producer set.
+  //      appKnowledgeToItem used to read tenant_metadata/app_metadata, which
+  //      buildKnowledgeItem never emits, so a synced file arrived on a unified
+  //      database as bare text plus a context_id.
+  {
+    const item = appKnowledgeToItem({
+      id: "claude-file:abc",
+      title: "CLAUDE.md",
+      source: "claude-code-plugin",
+      description: "Workspace context synced from t",
+      url: "hydradb://workspace/t/CLAUDE.md",
+      timestamp: "2026-09-05T10:00:00.000Z",
+      content: { text: "# Smoke" },
+      metadata: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
+      additional_metadata: { size_bytes: 7, plugin: "hydradb" }
+    });
+    assert.deepEqual(item, {
+      text: "# Smoke",
+      enrich: true,
+      context_id: "claude-file:abc",
+      title: "CLAUDE.md",
+      happened_at: "2026-09-05T10:00:00.000Z",
+      attributes: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
+      custom_attributes: {
+        size_bytes: 7,
+        plugin: "hydradb",
+        source: "claude-code-plugin",
+        description: "Workspace context synced from t",
+        url: "hydradb://workspace/t/CLAUDE.md"
+      }
+    });
+  }
+
+  // 13f) A field items[] has no home for is REFUSED, never dropped: is_markdown
+  //      changes how the server chunks and renders, and user_name on a text item
+  //      is the attribution. Both are set on every workspace memory chunk.
+  {
+    assert.throws(() => memoryToItem({ text: "# Title", is_markdown: true }), /is_markdown/);
+    assert.throws(() => memoryToItem({ text: "note", user_name: "Ada" }), /user_name/);
+    // A conversation DOES have a home for it, as the per-turn speaker name.
+    assert.deepEqual(
+      memoryToItem({ user_assistant_pairs: [{ user: "hi", assistant: "yo" }], user_name: "Ada" }).conversation,
+      [
+        { role: "user", content: "hi", name: "Ada" },
+        { role: "assistant", content: "yo" }
+      ]
+    );
+  }
+
+  return { tests: 18 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

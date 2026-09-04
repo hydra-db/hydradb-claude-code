@@ -22,12 +22,31 @@ const DEFAULT_WRITE_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 0;
 
 // A plain Error type so nothing downstream has to know about SDK exception
-// classes (CONTRACT §2 rule 4).
+// classes (CONTRACT §2 rule 4). `status` and `errorCode` are carried alongside
+// the message so callers branch on the server's MACHINE-READABLE answer instead
+// of pattern-matching prose: the layout refusal (PRO-1618) is worded two
+// different ways depending on which validator refuses, and a message regex
+// silently stops matching the day either sentence is reworded.
 export class HydraWrapperError extends Error {
-  constructor(message) {
+  constructor(message, { status, body, errorCode } = {}) {
     super(message);
     this.name = "HydraWrapperError";
+    this.status = status;
+    this.body = body;
+    this.errorCode = errorCode;
   }
+}
+
+// The v2 error envelope puts the code at `error.code`; some responses put it at
+// the top level. Returns undefined when the body is not the envelope (a plain
+// string, HTML from a proxy, an empty 500), which is exactly when the caller
+// must fall back to the message text.
+function extractErrorCode(body) {
+  if (!body || typeof body !== "object") {
+    return undefined;
+  }
+  const code = body.error?.code ?? body.code ?? body.error_code;
+  return typeof code === "string" && code ? code : undefined;
 }
 
 function coerceBody(body) {
@@ -54,7 +73,11 @@ function translateError(error, label, timeoutMs) {
   if (error instanceof HydraDBError) {
     const status = error.statusCode != null ? ` with ${error.statusCode}` : "";
     const body = coerceBody(error.body);
-    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`);
+    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`, {
+      status: error.statusCode,
+      body: error.body,
+      errorCode: extractErrorCode(error.body)
+    });
   }
   const message = error instanceof Error ? error.message : String(error);
   return new HydraWrapperError(`${label} failed: ${message}`);
@@ -235,7 +258,11 @@ export function createHydraWrapper({
       parsed = text;
     }
     if (!response.ok) {
-      throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`);
+      throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`, {
+        status: response.status,
+        body: parsed,
+        errorCode: extractErrorCode(parsed)
+      });
     }
     return parsed;
   }

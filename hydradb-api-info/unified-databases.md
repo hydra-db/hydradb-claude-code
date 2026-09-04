@@ -29,9 +29,16 @@ POST /context/ingest
         { "role": "user", "content": "...", "name": "Soham" },
         { "role": "assistant", "content": "..." } ],
       "enrich": true, "custom_instructions": "..." },
-    { "context_id": "claude-file:abc", "title": "CLAUDE.md", "text": "..." }
+    { "context_id": "claude-file:abc", "title": "CLAUDE.md", "text": "...",
+      "happened_at": "2026-09-05T10:00:00.000Z",
+      "attributes": { "workspace": "my-workspace", "relative_path": "CLAUDE.md", "extension": ".md" },
+      "custom_attributes": { "size_bytes": 4096, "plugin": "hydradb",
+        "source": "claude-code-plugin", "description": "Workspace context synced from my-workspace",
+        "url": "hydradb://workspace/my-workspace/CLAUDE.md" } }
   ]
 }
 ```
+
+A workspace file's `metadata` becomes `attributes` and its `additional_metadata` becomes `custom_attributes`; `timestamp` becomes `happened_at`. `source`, `description` and `url` have no field of their own on an item, so they ride in `custom_attributes` rather than being dropped — a synced file keeps the same provenance it has on a split database.
 
 `searchMode: "unified"` and `ingestionMode: "unified"` are accepted as explicit spellings, and `searchMode: "auto"` means `memory` on a split database; the layout always wins.
