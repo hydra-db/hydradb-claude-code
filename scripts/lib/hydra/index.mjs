@@ -37,15 +37,16 @@ export class HydraWrapperError extends Error {
   }
 }
 
-// The v2 error envelope puts the code at `error.code`; some responses put it at
-// the top level. Returns undefined when the body is not the envelope (a plain
-// string, HTML from a proxy, an empty 500), which is exactly when the caller
-// must fall back to the message text.
+// The v2 error envelope carries the code at `error.code` and repeats it at
+// `detail.error_code`; some responses put it at the top level. Returns
+// undefined when the body is not the envelope (a plain string, HTML from a
+// proxy, an empty 500), which is exactly when the caller must fall back to the
+// message text.
 function extractErrorCode(body) {
   if (!body || typeof body !== "object") {
     return undefined;
   }
-  const code = body.error?.code ?? body.code ?? body.error_code;
+  const code = body.error?.code ?? body.detail?.error_code ?? body.code ?? body.error_code;
   return typeof code === "string" && code ? code : undefined;
 }
 

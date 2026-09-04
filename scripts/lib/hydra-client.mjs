@@ -374,11 +374,14 @@ export function normalizeRetrievalResponse(response) {
 // first of those is ours to retry, so the code narrows and the message decides.
 export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
 
-// The two siblings under that code, excluded first. Both name a unified
-// database while telling you this one is SPLIT, or that the value is wrong
-// whatever the layout; retrying either as unified turns a clear 400 into a
-// second, more confusing one.
-const OTHER_CORPUS_REFUSAL_RE = /only valid on a unified database|only supported on a unified database|invalid type ['"]all['"]/i;
+// The siblings under that code, excluded first: `unified` sent to a SPLIT
+// database, `all` on an ingest, and a `type` outside the vocabulary entirely.
+// All three name a unified database or a bad value rather than answering "this
+// database is unified", and retrying any of them as unified turns a clear 400
+// into a second, more confusing one. `invalid type` covers both the syntax
+// refusal and the `all`-on-ingest one, which share that opening.
+const OTHER_CORPUS_REFUSAL_RE =
+  /only valid on a unified database|only supported on a unified database|invalid type/i;
 
 // The wording of the refusal that IS ours, for a server that sends no code (an
 // older build, a proxy that ate the envelope). Two validators answer it:

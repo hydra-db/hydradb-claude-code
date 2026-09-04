@@ -611,11 +611,21 @@ export async function runHttpTests() {
     );
     const queries = sink.filter((req) => req.path === "/query");
     assert.equal(queries.length, 1, "no retry: this refusal is not ours");
-    // And the third sibling: `all` on an ingest is a bad value, not a layout answer.
-    assert.equal(
-      isUnifiedLayoutRefusal(new Error("unified ingest failed with 400: invalid type 'all': it selects both corpora")),
-      false
+    // And the other two siblings. `all` on an ingest and a `type` outside the
+    // vocabulary both carry CORPUS_TYPE_UNSUPPORTED too, so the code alone
+    // would have retried a typo as unified.
+    const allOnIngest = new Error("unified ingest failed with 400: invalid type 'all': it selects both corpora");
+    allOnIngest.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(allOnIngest), false);
+    const badType = new Error(
+      `query failed with 400: invalid type "momory": must be 'knowledge', 'memory', 'unified' or 'all'`
     );
+    badType.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(badType), false, "a typo'd type is not a layout answer");
+    // The code is read from `detail.error_code` as well as `error.code`.
+    const viaDetail = new Error("ingest failed with 400: the corpus refused this request");
+    viaDetail.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(viaDetail), true, "the code carries a refusal the regex cannot see");
   }
 
   return { tests: 19 };
