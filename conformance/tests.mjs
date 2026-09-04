@@ -611,47 +611,101 @@ export async function runHttpTests() {
     );
     const queries = sink.filter((req) => req.path === "/query");
     assert.equal(queries.length, 1, "no retry: this refusal is not ours");
-    // And the other two siblings. `all` on an ingest and a `type` outside the
-    // vocabulary both carry CORPUS_TYPE_UNSUPPORTED too, so the code alone
-    // would have retried a typo as unified.
-    const allOnIngest = new Error("unified ingest failed with 400: invalid type 'all': it selects both corpora");
-    allOnIngest.errorCode = "CORPUS_TYPE_UNSUPPORTED";
-    assert.equal(isUnifiedLayoutRefusal(allOnIngest), false);
-    const badType = new Error(
-      `query failed with 400: invalid type "momory": must be 'knowledge', 'memory', 'unified' or 'all'`
+  }
+
+  // 13h) The client half of the server's TestCorpusRefusalWordingIsAClientContract.
+  //
+  //      ONE code, CORPUS_TYPE_UNSUPPORTED, covers six refusals and they do not
+  //      point the same way: two mean "retry as unified", four mean the caller
+  //      must change something else. Retrying one of the four would turn a
+  //      clear 400 into a second one AND pin a SPLIT database to `unified` for
+  //      the life of the process. So the code cannot decide direction on its
+  //      own and the wording is a contract on both sides of the wire — the
+  //      server has a test asserting these strings, this is the half that
+  //      asserts we still read them correctly.
+  //
+  //      Verbatim from application/internal/api/handler/{corpus,context,errors}.go
+  //      and platform/storagelayout/corpus_type.go.
+  {
+    const DOCS = "See https://docs.hydradb.com/api-reference/v2/endpoint/ingest for usage details. ";
+    const refusals = [
+      [
+        "an unknown type (validateCorpusSyntax)",
+        false,
+        `invalid type "momory": must be 'knowledge', 'memory', 'unified' or 'all'. ${DOCS}`
+      ],
+      [
+        "knowledge/memory on a UNIFIED database (ValidateCorpusType) — ours",
+        true,
+        `type "memory" is not valid on a unified database: knowledge and memory are one corpus here, ` +
+          `so there is nothing to select between. Omit \`type\` (or send "unified") and filter on the ` +
+          `is_memory attribute if you need one kind. ${DOCS}`
+      ],
+      [
+        "`unified` on a SPLIT database (ValidateCorpusType) — the opposite direction",
+        false,
+        `type "unified" is only valid on a unified database; this database stores knowledge and memory ` +
+          `separately, so use "knowledge", "memory" or "all", or create a new unified database. ${DOCS}`
+      ],
+      [
+        "`all` on an ingest, unified advice — the phrase-inside-the-advice trap",
+        false,
+        "invalid type 'all': it selects both corpora for reads and deletes, but an ingest must name " +
+          "the one it writes to. This database is unified, so send 'unified' or omit `type` entirely. " +
+          DOCS
+      ],
+      [
+        "`all` on an ingest, split advice",
+        false,
+        "invalid type 'all': it selects both corpora for reads and deletes, but an ingest must name " +
+          "the one it writes to. Use 'knowledge' or 'memory'. " + DOCS
+      ],
+      [
+        "items[] combined with type=knowledge",
+        false,
+        "items cannot be combined with type=knowledge: items are memory-shaped (text or a " +
+          "conversation); omit type or use the unified default. " + DOCS
+      ],
+      [
+        "split-era fields against a unified database (ingest body) — ours",
+        true,
+        "this database is unified: send the content as `items` (a JSON array of text or conversation " +
+          "items), either as a form field or as an application/json body; documents, app_knowledge " +
+          "and memories are only accepted on a split database. " + DOCS
+      ]
+    ];
+    for (const [name, shouldRetry, serverMessage] of refusals) {
+      // As the wrapper builds it: the whole JSON body stringified into the message.
+      const error = new Error(
+        `ingest failed with 400: ${JSON.stringify({
+          success: false,
+          error: { code: "CORPUS_TYPE_UNSUPPORTED", message: serverMessage }
+        })}`
+      );
+      error.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+      assert.equal(isUnifiedLayoutRefusal(error), shouldRetry, `${name}: retry=${shouldRetry}`);
+    }
+
+    // context_category carries its OWN code (CONTEXT_CATEGORY_UNSUPPORTED), so
+    // it can never reach this branch. Pinned anyway: the message names a
+    // unified database, and the fix is to stop sending the field, never to
+    // retry with a different `type`.
+    const categoryRefusal = new Error(
+      "query failed with 400: context_category is only supported on a unified database, where " +
+        "knowledge and memory are one corpus. This database is split, so `type` already selects the " +
+        'corpus; omit context_category (or send "auto"). '
     );
-    badType.errorCode = "CORPUS_TYPE_UNSUPPORTED";
-    assert.equal(isUnifiedLayoutRefusal(badType), false, "a typo'd type is not a layout answer");
-    // The `all`-on-ingest advice is layout-aware and now says "This database is
-    // unified, so send 'unified'…" inside a refusal that is NOT ours. Excluding
-    // on `invalid type` BEFORE reading the code is what keeps that sentence
-    // from being read as a layout answer — this pins that ordering.
-    const allOnUnified = new Error(
-      "unified ingest failed with 400: invalid type 'all': it selects both corpora for reads and " +
-        "deletes, but an ingest must name the one it writes to. This database is unified, so send " +
-        "'unified' or omit `type` entirely."
-    );
-    allOnUnified.errorCode = "CORPUS_TYPE_UNSUPPORTED";
-    assert.equal(
-      isUnifiedLayoutRefusal(allOnUnified),
-      false,
-      "the advice clause names a unified database but the refusal is still not ours"
-    );
-    // items[] with type=knowledge is a caller error, not a layout answer, and a
-    // retry that pinned unified would strand a SPLIT database on it.
-    const itemsWithKnowledge = new Error(
-      "unified ingest failed with 400: items cannot be combined with type=knowledge: items are " +
-        "memory-shaped (text or a conversation); omit type or use the unified default."
-    );
-    itemsWithKnowledge.errorCode = "CORPUS_TYPE_UNSUPPORTED";
-    assert.equal(isUnifiedLayoutRefusal(itemsWithKnowledge), false);
-    // The code is read from `detail.error_code` as well as `error.code`.
+    categoryRefusal.errorCode = "CONTEXT_CATEGORY_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(categoryRefusal), false);
+
+    // And the code is read from `detail.error_code` as well as `error.code`,
+    // so it can still carry a refusal whose wording the regex cannot see.
     const viaDetail = new Error("ingest failed with 400: the corpus refused this request");
     viaDetail.errorCode = "CORPUS_TYPE_UNSUPPORTED";
     assert.equal(isUnifiedLayoutRefusal(viaDetail), true, "the code carries a refusal the regex cannot see");
   }
 
-  return { tests: 19 };
+  return { tests: 20 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
