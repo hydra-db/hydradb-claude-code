@@ -22,12 +22,32 @@ const DEFAULT_WRITE_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 0;
 
 // A plain Error type so nothing downstream has to know about SDK exception
-// classes (CONTRACT §2 rule 4).
+// classes (CONTRACT §2 rule 4). `status` and `errorCode` are carried alongside
+// the message so callers branch on the server's MACHINE-READABLE answer instead
+// of pattern-matching prose: the layout refusal (PRO-1618) is worded two
+// different ways depending on which validator refuses, and a message regex
+// silently stops matching the day either sentence is reworded.
 export class HydraWrapperError extends Error {
-  constructor(message) {
+  constructor(message, { status, body, errorCode } = {}) {
     super(message);
     this.name = "HydraWrapperError";
+    this.status = status;
+    this.body = body;
+    this.errorCode = errorCode;
   }
+}
+
+// The v2 error envelope carries the code at `error.code` and repeats it at
+// `detail.error_code`; some responses put it at the top level. Returns
+// undefined when the body is not the envelope (a plain string, HTML from a
+// proxy, an empty 500), which is exactly when the caller must fall back to the
+// message text.
+function extractErrorCode(body) {
+  if (!body || typeof body !== "object") {
+    return undefined;
+  }
+  const code = body.error?.code ?? body.detail?.error_code ?? body.code ?? body.error_code;
+  return typeof code === "string" && code ? code : undefined;
 }
 
 function coerceBody(body) {
@@ -54,7 +74,11 @@ function translateError(error, label, timeoutMs) {
   if (error instanceof HydraDBError) {
     const status = error.statusCode != null ? ` with ${error.statusCode}` : "";
     const body = coerceBody(error.body);
-    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`);
+    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`, {
+      status: error.statusCode,
+      body: error.body,
+      errorCode: extractErrorCode(error.body)
+    });
   }
   const message = error instanceof Error ? error.message : String(error);
   return new HydraWrapperError(`${label} failed: ${message}`);
@@ -201,6 +225,54 @@ export function createHydraWrapper({
     }
   }
 
+  // PRO-1618: the vendored SDK predates `items` on ingest, `type` on database
+  // create and `details[]` on the database list, and it drops fields it does
+  // not know. Those three calls go over the wire by hand, through the same
+  // envelope unwrap and error translation, until the SDK is regenerated.
+  const rawFetch = fetchImpl ?? globalThis.fetch;
+  const rawBase = baseUrl.replace(/\/+$/g, "");
+  async function rawJson(label, method, path, body, timeoutMs) {
+    let response;
+    try {
+      response = await rawFetch(`${rawBase}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          // CONTRACT S2 rule 6: every v2 call names its version.
+          "API-Version": "2"
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        throw new HydraWrapperError(`${label} timed out after ${timeoutMs}ms`);
+      }
+      throw translateError(error, label, timeoutMs);
+    }
+    const text = await response.text().catch(() => "");
+    let parsed = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = text;
+    }
+    if (!response.ok) {
+      throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`, {
+        status: response.status,
+        body: parsed,
+        errorCode: extractErrorCode(parsed)
+      });
+    }
+    return parsed;
+  }
+  // The generated client's REQUEST serializers reject `type: "unified"`
+  // before anything is sent (their enum predates PRO-1618), so every call
+  // that names that kind is built by hand. The wire is already snake_case,
+  // which is the shape the plugin normalises everything to anyway.
+  const unifiedKind = (args) => args.kind === "unified";
+
   function requestOptions(timeoutMs) {
     return { timeoutInSeconds: Math.max(1, Math.ceil(timeoutMs / 1000)), maxRetries: MAX_RETRIES };
   }
@@ -228,6 +300,21 @@ export function createHydraWrapper({
   const context = {
     async query(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        return unwrapAndNormalize(
+          await rawJson("/query", "POST", "/query", {
+            ...contextScope(),
+            query: args.query,
+            type: "unified",
+            ...(args.operator ? { operator: args.operator } : {}),
+            ...(args.mode ? { mode: args.mode } : {}),
+            ...(args.maxResults != null ? { max_results: args.maxResults } : {}),
+            ...(args.alpha != null ? { alpha: args.alpha } : {}),
+            ...(args.recencyBias != null ? { recency_bias: args.recencyBias } : {}),
+            ...(args.graphContext != null ? { graph_context: args.graphContext } : {})
+          }, timeoutMs)
+        );
+      }
       const request = {
         ...contextScope(),
         query: args.query,
@@ -246,6 +333,18 @@ export function createHydraWrapper({
 
     async ingest(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
+      if (args.items != null) {
+        // The unified shape (PRO-1618): items[], each text or a conversation,
+        // no corpus selector. On a split database they land in the memory
+        // corpus; on a unified database they are the only shape accepted.
+        return unwrapAndNormalize(
+          await rawJson("/context/ingest", "POST", "/context/ingest", {
+            ...contextScope(),
+            items: args.items,
+            ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {})
+          }, timeoutMs)
+        );
+      }
       // Ingest carries a top-level tenant_id (one of the DX-G-002 defects) and
       // the SAME canonical `collection` that delete uses, so an ingest and a
       // later delete resolve to the identical scope (the server filters delete
@@ -270,6 +369,11 @@ export function createHydraWrapper({
 
     async list(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        return unwrapAndNormalize(
+          await rawJson("/context/list", "POST", "/context/list", { ...contextScope(), type: "unified" }, timeoutMs)
+        );
+      }
       const request = { ...contextScope(), ...(args.kind ? { type: args.kind } : {}) };
       return unwrapAndNormalize(
         await call("/context/list", timeoutMs, () => client.context.list(request, requestOptions(timeoutMs)))
@@ -295,6 +399,12 @@ export function createHydraWrapper({
 
     async relations(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+      if (unifiedKind(args)) {
+        const params = new URLSearchParams({ ...contextScope(), type: "unified", ...(args.id ? { id: args.id } : {}) });
+        return unwrapAndNormalize(
+          await rawJson("/context/relations", "GET", `/context/relations?${params.toString()}`, undefined, timeoutMs)
+        );
+      }
       const request = { ...contextScope(), ...(args.id ? { id: args.id } : {}) };
       return unwrapAndNormalize(
         await call("/context/relations", timeoutMs, () => client.context.relations(request, requestOptions(timeoutMs)))
@@ -316,9 +426,9 @@ export function createHydraWrapper({
         ids: args.ids,
         ...(args.kind ? { type: args.kind } : {})
       };
-      const envelope = await call("/context (delete)", timeoutMs, () =>
-        client.context.delete(request, requestOptions(timeoutMs))
-      );
+      const envelope = unifiedKind(args)
+        ? await rawJson("/context (delete)", "DELETE", "/context", request, timeoutMs)
+        : await call("/context (delete)", timeoutMs, () => client.context.delete(request, requestOptions(timeoutMs)));
       const data = unwrapAndNormalize(envelope) ?? {};
       const { deletedIds, failedIds } = classifyDeletion(requestedIds, envelope, data);
       return { deletedIds, failedIds, data };
@@ -326,9 +436,21 @@ export function createHydraWrapper({
   };
 
   // databases.* operate on an explicit target database, not the configured scope.
+  let layoutsPromise = null;
   const databases = {
     async create(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
+      if (args.type != null) {
+        // `type` (split|unified) is dropped by the vendored SDK's serializer,
+        // which would provision a split database in silence.
+        return unwrapAndNormalize(
+          await rawJson("/databases (create)", "POST", "/databases", {
+            database: args.database,
+            type: args.type,
+            ...(args.extra || {})
+          }, timeoutMs)
+        );
+      }
       const request = { database: args.database, ...(args.extra || {}) };
       return unwrapAndNormalize(
         await call("/databases (create)", timeoutMs, () => client.databases.create(request, requestOptions(timeoutMs)))
@@ -347,6 +469,39 @@ export function createHydraWrapper({
       return unwrapAndNormalize(
         await call("/databases", timeoutMs, () => client.databases.list(requestOptions(timeoutMs)))
       );
+    },
+    // Every database this key can see, mapped to its storage layout (PRO-1618),
+    // from GET /databases details[]. Memoised: a layout is fixed at creation.
+    async layouts(opts = {}) {
+      if (!layoutsPromise) {
+        const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
+        layoutsPromise = rawJson("/databases", "GET", "/databases", undefined, timeoutMs)
+          .then((envelope) => unwrapAndNormalize(envelope))
+          .then((listed) => {
+            const map = new Map();
+            for (const row of Array.isArray(listed?.details) ? listed.details : []) {
+              if (row && row.database) {
+                map.set(String(row.database), row.type === "unified" ? "unified" : "split");
+              }
+            }
+            return map;
+          })
+          .catch((error) => {
+            layoutsPromise = null;
+            throw error;
+          });
+      }
+      return layoutsPromise;
+    },
+    // The layout of one database. Unknown, or a failed probe, reads as split:
+    // the layout of every database created before PRO-1618, so the worst case
+    // is the old default, never a wrong unified call.
+    async layout(database, opts = {}) {
+      try {
+        return (await databases.layouts(opts)).get(database) ?? "split";
+      } catch {
+        return "split";
+      }
     },
     async collections(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;

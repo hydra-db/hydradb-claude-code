@@ -12,14 +12,23 @@ import os from "node:os";
 import path from "node:path";
 
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
-import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
+import {
+  appKnowledgeToItem,
+  HydraClient,
+  isUnifiedLayoutRefusal,
+  memoryToItem,
+  normalizeRetrievalResponse
+} from "../scripts/lib/hydra-client.mjs";
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
 
 function fakeResponse(payload) {
-  const text = JSON.stringify(payload);
+  // A responder may name the HTTP status through `__status` (default 200),
+  // so a wire test can make the server refuse a request the way it really does.
+  const { __status: status = 200, ...body } = payload && typeof payload === "object" ? payload : {};
+  const text = JSON.stringify(payload && typeof payload === "object" ? body : payload);
   return {
-    ok: true,
-    status: 200,
+    ok: status < 400,
+    status,
     headers: {
       get: (name) => (String(name).toLowerCase() === "content-type" ? "application/json" : null),
       has: () => false,
@@ -331,7 +340,372 @@ export async function runHttpTests() {
     assert.equal(inspect.chunk_content, "body");
   }
 
-  return { tests: 9 };
+  // 10) PRO-1618: unified recall is a hand-built POST /query with type=unified
+  //     (the vendored SDK's request serializer rejects the value), and the
+  //     result goes through the same snake_case seam.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, () => ({
+        data: { chunks: [{ chunk_uuid: "c1", chunk_content: "body", source_title: "T" }] },
+        success: true
+      }))
+    });
+    const res = await client.recallUnified("acme");
+    const req = sink.at(-1);
+    assert.equal(req.path, "/query");
+    assert.equal(req.httpMethod, "POST");
+    assert.equal(req.contentType, "application/json");
+    const body = JSON.parse(req.bodyString);
+    assert.equal(body.type, "unified");
+    assert.equal(body.database, "db_test");
+    assert.equal(body.collection, "col_test");
+    assert.equal(res.chunks[0].text, "body");
+  }
+
+  // 11) Unified delete is a hand-built DELETE /context with type=unified, and
+  //     the per-id classification still sees the envelope.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, () => ({ data: { deleted_count: 1 }, success: true }))
+    });
+    const result = await client._hydra.context.delete({ ids: ["item-1"], kind: "unified" });
+    const req = sink.at(-1);
+    assert.equal(req.path, "/context");
+    assert.equal(req.httpMethod, "DELETE");
+    const body = JSON.parse(req.bodyString);
+    assert.equal(body.type, "unified");
+    assert.deepEqual(body.ids, ["item-1"]);
+    assert.deepEqual(result.deletedIds, ["item-1"]);
+  }
+
+  // 12) On a unified database every memory write becomes the items[] JSON
+  //     body after one layout probe; the split-era `memories` field is never sent.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
+          : { data: { success_count: 1, failed_count: 0 }, success: true }
+      )
+    });
+    await client.addMemories([{ text: "the user prefers dark mode", infer: true, source_id: "m1" }]);
+    assert.equal(sink[0].path, "/databases", "the layout is probed once, first");
+    const req = sink.at(-1);
+    assert.equal(req.path, "/context/ingest");
+    assert.equal(req.contentType, "application/json", "unified ingest is the JSON items[] body");
+    const body = JSON.parse(req.bodyString);
+    assert.deepEqual(body.items, [{ text: "the user prefers dark mode", context_id: "m1", enrich: true }]);
+    assert.ok(!("memories" in body));
+  }
+
+  // 13) A probe that fails reads as split, and when the server then names the
+  //     rule the client pins unified and retries once.
+  {
+    const sink = [];
+    let calls = 0;
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        calls += 1;
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        if (req.path === "/context/ingest" && req.contentType === "multipart/form-data") {
+          return {
+            __status: 400,
+            success: false,
+            error: { code: "VALIDATION_ERROR", message: "type 'memory' is not valid on a unified database" }
+          };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await client.addMemories([{ text: "note" }]);
+    assert.equal(sink.at(-1).contentType, "application/json", "retried as the unified items[] body");
+    assert.equal(await client.isUnified(), true, "the refusal pins the layout for later calls");
+  }
+
+  // 13b) The SAME recovery for the knowledge lane. uploadKnowledge was the one
+  //      layout-sensitive write with no try/catch, so a flaky layout probe left
+  //      every workspace file in the knowledge lane 400ing for the life of the
+  //      process while the memory lane in the same sync recovered.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        if (req.path === "/context/ingest" && req.contentType === "multipart/form-data") {
+          return {
+            __status: 400,
+            success: false,
+            error: { code: "VALIDATION_ERROR", message: "type 'knowledge' is not valid on a unified database" }
+          };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await client.uploadKnowledge([
+      { id: "claude-file:a", title: "CLAUDE.md", content: { text: "# Smoke" } }
+    ]);
+    const req = sink.at(-1);
+    assert.equal(req.contentType, "application/json", "knowledge retries as the unified items[] body too");
+    assert.deepEqual(JSON.parse(req.bodyString).items, [
+      { text: "# Smoke", enrich: true, context_id: "claude-file:a", title: "CLAUDE.md" }
+    ]);
+    assert.equal(await client.isUnified(), true, "the knowledge refusal pins the layout too");
+  }
+
+  // 13c) The ingest-body wording of the same refusal ("this database is
+  //      unified: send the content as `items`") is the one the old
+  //      /unified database/i pattern missed entirely, and the retry is pinned
+  //      only once it has actually succeeded.
+  {
+    const sink = [];
+    let ingests = 0;
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        if (req.path === "/databases") return { __status: 500, success: false, error: { message: "boom" } };
+        ingests += 1;
+        if (ingests === 1) {
+          return {
+            __status: 400,
+            success: false,
+            error: {
+              code: "CORPUS_TYPE_UNSUPPORTED",
+              message:
+                "this database is unified: send the content as `items` (a JSON array of text or conversation items)"
+            }
+          };
+        }
+        if (ingests === 2) {
+          return { __status: 503, success: false, error: { message: "upstream unavailable" } };
+        }
+        return { data: { success_count: 1, failed_count: 0 }, success: true };
+      })
+    });
+    await assert.rejects(
+      () => client.addMemories([{ text: "note" }]),
+      /503/,
+      "a retry that fails for an unrelated reason propagates that failure"
+    );
+    assert.equal(
+      await client.isUnified(),
+      false,
+      "and must NOT pin the layout: the retry never proved the database is unified"
+    );
+  }
+
+  // 13d) A knowledge record with no text is dropped rather than sent: server
+  //      validation is per item but all-or-nothing per request, so one empty
+  //      record would 400 the whole batch where the split lane stored it.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
+          : { data: { success_count: 1, failed_count: 0 }, success: true }
+      )
+    });
+    await client.uploadKnowledge([
+      { id: "claude-file:empty", title: "EMPTY.md", content: { text: "   " } },
+      { id: "claude-file:real", title: "CLAUDE.md", content: { text: "# Smoke" } }
+    ]);
+    const items = JSON.parse(sink.at(-1).bodyString).items;
+    assert.equal(items.length, 1, "the empty record is skipped, not sent");
+    assert.equal(items[0].context_id, "claude-file:real");
+  }
+
+  // 13e) The workspace-sync knowledge record keeps everything its producer set.
+  //      appKnowledgeToItem used to read tenant_metadata/app_metadata, which
+  //      buildKnowledgeItem never emits, so a synced file arrived on a unified
+  //      database as bare text plus a context_id.
+  {
+    const item = appKnowledgeToItem({
+      id: "claude-file:abc",
+      title: "CLAUDE.md",
+      source: "claude-code-plugin",
+      description: "Workspace context synced from t",
+      url: "hydradb://workspace/t/CLAUDE.md",
+      timestamp: "2026-09-05T10:00:00.000Z",
+      content: { text: "# Smoke" },
+      metadata: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
+      additional_metadata: { size_bytes: 7, plugin: "hydradb" }
+    });
+    assert.deepEqual(item, {
+      text: "# Smoke",
+      enrich: true,
+      context_id: "claude-file:abc",
+      title: "CLAUDE.md",
+      happened_at: "2026-09-05T10:00:00.000Z",
+      attributes: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
+      custom_attributes: {
+        size_bytes: 7,
+        plugin: "hydradb",
+        source: "claude-code-plugin",
+        description: "Workspace context synced from t",
+        url: "hydradb://workspace/t/CLAUDE.md"
+      }
+    });
+  }
+
+  // 13f) is_markdown and user_name are CARRIED, not dropped: the first changes
+  //      how the server chunks and renders, the second is the attribution, and
+  //      buildMemoryItems sets both on every workspace memory chunk.
+  {
+    assert.deepEqual(memoryToItem({ text: "# Title", is_markdown: true, user_name: "Ada" }), {
+      text: "# Title",
+      is_markdown: true,
+      user_name: "Ada",
+      enrich: true
+    });
+    assert.equal(
+      memoryToItem({ text: "note", is_markdown: false }).is_markdown,
+      false,
+      "an explicit false is still the caller's answer, not an absent field"
+    );
+    // A conversation's attribution rides on the per-turn speaker name instead.
+    const conversationItem = memoryToItem({
+      user_assistant_pairs: [{ user: "hi", assistant: "yo" }],
+      user_name: "Ada"
+    });
+    assert.deepEqual(conversationItem.conversation, [
+      { role: "user", content: "hi", name: "Ada" },
+      { role: "assistant", content: "yo" }
+    ]);
+    assert.ok(!("user_name" in conversationItem), "a conversation does not repeat it at item level");
+  }
+
+  // 13g) CORPUS_TYPE_UNSUPPORTED covers three refusals and only one is ours.
+  //      `unified` sent to a SPLIT database carries the same code; retrying it
+  //      as unified would turn a clear 400 into a second, more confusing one.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "split" }] }, success: true }
+          : {
+              __status: 400,
+              success: false,
+              error: {
+                code: "CORPUS_TYPE_UNSUPPORTED",
+                message:
+                  'type "unified" is only valid on a unified database; this database stores knowledge and memory separately'
+              }
+            }
+      )
+    });
+    await assert.rejects(
+      () => client.recallUnified("acme"),
+      /only valid on a unified database/,
+      "the sibling refusal propagates rather than being retried"
+    );
+    const queries = sink.filter((req) => req.path === "/query");
+    assert.equal(queries.length, 1, "no retry: this refusal is not ours");
+  }
+
+  // 13h) The client half of the server's TestCorpusRefusalWordingIsAClientContract.
+  //
+  //      ONE code, CORPUS_TYPE_UNSUPPORTED, covers six refusals and they do not
+  //      point the same way: two mean "retry as unified", four mean the caller
+  //      must change something else. Retrying one of the four would turn a
+  //      clear 400 into a second one AND pin a SPLIT database to `unified` for
+  //      the life of the process. So the code cannot decide direction on its
+  //      own and the wording is a contract on both sides of the wire — the
+  //      server has a test asserting these strings, this is the half that
+  //      asserts we still read them correctly.
+  //
+  //      Verbatim from application/internal/api/handler/{corpus,context,errors}.go
+  //      and platform/storagelayout/corpus_type.go.
+  {
+    const DOCS = "See https://docs.hydradb.com/api-reference/v2/endpoint/ingest for usage details. ";
+    const refusals = [
+      [
+        "an unknown type (validateCorpusSyntax)",
+        false,
+        `invalid type "momory": must be 'knowledge', 'memory', 'unified' or 'all'. ${DOCS}`
+      ],
+      [
+        "knowledge/memory on a UNIFIED database (ValidateCorpusType) — ours",
+        true,
+        `type "memory" is not valid on a unified database: knowledge and memory are one corpus here, ` +
+          `so there is nothing to select between. Omit \`type\` (or send "unified") and filter on the ` +
+          `is_memory attribute if you need one kind. ${DOCS}`
+      ],
+      [
+        "`unified` on a SPLIT database (ValidateCorpusType) — the opposite direction",
+        false,
+        `type "unified" is only valid on a unified database; this database stores knowledge and memory ` +
+          `separately, so use "knowledge", "memory" or "all", or create a new unified database. ${DOCS}`
+      ],
+      [
+        "`all` on an ingest, unified advice — the phrase-inside-the-advice trap",
+        false,
+        "invalid type 'all': it selects both corpora for reads and deletes, but an ingest must name " +
+          "the one it writes to. This database is unified, so send 'unified' or omit `type` entirely. " +
+          DOCS
+      ],
+      [
+        "`all` on an ingest, split advice",
+        false,
+        "invalid type 'all': it selects both corpora for reads and deletes, but an ingest must name " +
+          "the one it writes to. Use 'knowledge' or 'memory'. " + DOCS
+      ],
+      [
+        "items[] combined with type=knowledge",
+        false,
+        "items cannot be combined with type=knowledge: items are memory-shaped (text or a " +
+          "conversation); omit type or use the unified default. " + DOCS
+      ],
+      [
+        "split-era fields against a unified database (ingest body) — ours",
+        true,
+        "this database is unified: send the content as `items` (a JSON array of text or conversation " +
+          "items), either as a form field or as an application/json body; documents, app_knowledge " +
+          "and memories are only accepted on a split database. " + DOCS
+      ]
+    ];
+    for (const [name, shouldRetry, serverMessage] of refusals) {
+      // As the wrapper builds it: the whole JSON body stringified into the message.
+      const error = new Error(
+        `ingest failed with 400: ${JSON.stringify({
+          success: false,
+          error: { code: "CORPUS_TYPE_UNSUPPORTED", message: serverMessage }
+        })}`
+      );
+      error.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+      assert.equal(isUnifiedLayoutRefusal(error), shouldRetry, `${name}: retry=${shouldRetry}`);
+    }
+
+    // context_category carries its OWN code (CONTEXT_CATEGORY_UNSUPPORTED), so
+    // it can never reach this branch. Pinned anyway: the message names a
+    // unified database, and the fix is to stop sending the field, never to
+    // retry with a different `type`.
+    const categoryRefusal = new Error(
+      "query failed with 400: context_category is only supported on a unified database, where " +
+        "knowledge and memory are one corpus. This database is split, so `type` already selects the " +
+        'corpus; omit context_category (or send "auto"). '
+    );
+    categoryRefusal.errorCode = "CONTEXT_CATEGORY_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(categoryRefusal), false);
+
+    // And the code is read from `detail.error_code` as well as `error.code`,
+    // so it can still carry a refusal whose wording the regex cannot see.
+    const viaDetail = new Error("ingest failed with 400: the corpus refused this request");
+    viaDetail.errorCode = "CORPUS_TYPE_UNSUPPORTED";
+    assert.equal(isUnifiedLayoutRefusal(viaDetail), true, "the code carries a refusal the regex cannot see");
+  }
+
+  return { tests: 20 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
