@@ -684,6 +684,7 @@ function formatStatusText(summary) {
     `ingestionMode: ${summary.resolvedConfig.ingestionMode}`,
     `recallMode: ${summary.resolvedConfig.recallMode}`,
     `graphContext: ${summary.resolvedConfig.graphContext}`,
+    `followForcefulRelations: ${summary.resolvedConfig.followForcefulRelations}`,
     `maxContextChars: ${summary.resolvedConfig.maxContextChars}`,
     `requestTimeoutMs: ${summary.resolvedConfig.requestTimeoutMs}`,
     `writeTimeoutMs: ${summary.resolvedConfig.writeTimeoutMs}`,

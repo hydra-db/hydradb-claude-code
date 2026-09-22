@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { buildHydraContextBlock } from "../scripts/lib/context-format.mjs";
+import { buildHydraContextBlock, buildUnifiedStructuredString } from "../scripts/lib/context-format.mjs";
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import {
   appKnowledgeToItem,
@@ -434,6 +434,18 @@ export async function runHttpTests() {
       "",
       "an empty unified recall injects nothing"
     );
+
+    // The structured rendering (query text output, and the only fallback)
+    // carries every field the contract puts on a chunk, temporal facts included.
+    const structured = buildUnifiedStructuredString(unified);
+    assert.ok(structured.includes("[1] context_id: chat-2026-07-29#w2 (score 0.87)"));
+    assert.ok(structured.includes("Enrichment: User prefers short, bullet-point answers."));
+    assert.ok(
+      structured.includes("Temporal: Refund window was 14 days. Start: 2025-01-01, End: 2026-06-30"),
+      "a temporal fact is rendered with the chunk it dates"
+    );
+    assert.ok(structured.includes("[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)"));
+    assert.ok(structured.includes("[P1] John is on the Pro plan since June 2026."));
   }
 
   // 11) Unified delete is a hand-built DELETE /context with NO `type`
@@ -556,6 +568,73 @@ export async function runHttpTests() {
     ]);
     assert.equal(parsed.success, false);
     assert.equal(parsed.message, "1 of 2 queued");
+  }
+
+  // 12c) A 202 that refuses an item is a FAILED write, not a return value.
+  //      The workspace sync records a file as synced the moment the write
+  //      returns and skips it while its digest is unchanged, so a refusal that
+  //      came back quietly would never be retried. It is raised like a split
+  //      database's 4xx, naming the context id and reason, and the sync leaves
+  //      the file untracked so the next run sends it again.
+  {
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) =>
+        req.path === "/databases"
+          ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
+          : {
+              data: {
+                success: false,
+                message: "1 of 2 queued",
+                results: [
+                  { source_id: "ok-1", title: null, status: "queued", infer: true, error: null, error_code: null },
+                  { source_id: "bad-2", title: null, status: "failed", infer: true, error: "text too large", error_code: "ITEM_TOO_LARGE" }
+                ],
+                success_count: 1,
+                failed_count: 1
+              },
+              success: true
+            }
+      )
+    });
+    await assert.rejects(
+      () => client.addMemories([{ text: "a", source_id: "ok-1" }, { text: "b", source_id: "bad-2" }]),
+      (error) => {
+        assert.match(error.message, /refused 1 of 2 items/);
+        assert.match(error.message, /bad-2: text too large/);
+        assert.equal(error.ingest.failed[0].contextId, "bad-2");
+        assert.deepEqual(error.ingest.contextIds, ["ok-1"]);
+        return true;
+      }
+    );
+
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-ingest-refused-"));
+    await fs.writeFile(path.join(dir, "NOTES.md"), "# Notes\n", "utf8");
+    const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
+    await assert.rejects(
+      () =>
+        syncWorkspace({
+          client,
+          config: {
+            includeGlobs: ["*.md"],
+            excludeGlobs: [],
+            maxFileSizeBytes: 50 * 1024 * 1024,
+            maxFilesPerSync: 25,
+            maxMemoryCharsPerChunk: 50 * 1024 * 1024,
+            maxMemoryChunksPerFile: 1,
+            ingestionMode: "memory",
+            writeTimeoutMs: 15000,
+            userName: "",
+            workspaceMemoryCustomInstructions: ""
+          },
+          projectRoot: dir,
+          workspaceName: "t",
+          state
+        }),
+      /refused/
+    );
+    assert.deepEqual(state.files, {}, "a refused write must not record the file as synced");
   }
 
   // 13) A probe that fails reads as split, and when the server then names the
@@ -902,7 +981,7 @@ export async function runHttpTests() {
     assert.deepEqual(JSON.parse(sink.at(-1).bodyString), { database: "new_db", type: "unified" });
   }
 
-  return { tests: 24 };
+  return { tests: 25 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

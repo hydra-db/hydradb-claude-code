@@ -775,6 +775,14 @@ export class HydraClient {
   // One unified write (CONTRACT: POST /context/ingest as a JSON body whose
   // list key is `context`), with the request-level enrich/upsert/instructions
   // defaults when the caller sets them. Returns the parsed 202.
+  //
+  // A 202 is per item: the server queues what it can and names the rest in
+  // results[] with status "failed". That is not a success for the caller.
+  // The workspace sync records a file as synced as soon as the write returns
+  // and skips it on every later sync while its digest is unchanged, so a
+  // refused item that came back as a return value would be lost for good.
+  // It is raised instead, the way a split database's 4xx is, with the context
+  // ids and reasons in the message and the parsed 202 attached as `ingest`.
   async addItems(items, options = {}) {
     const data = await this._hydra.context.ingest(
       {
@@ -785,7 +793,20 @@ export class HydraClient {
       },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
-    return parseUnifiedIngestResponse(data);
+    const parsed = parseUnifiedIngestResponse(data);
+    if (parsed.failed.length || parsed.failedCount > 0 || !parsed.success) {
+      const refused = parsed.failed.length || parsed.failedCount;
+      const reasons = parsed.failed.map(
+        (entry) => `${entry.contextId || "(no id)"}: ${entry.error || entry.errorCode || "unknown error"}`
+      );
+      const detail = reasons.length ? reasons.join("; ") : parsed.message || "no reason given";
+      const error = new Error(
+        `/context/ingest refused ${refused} of ${parsed.results.length || items.length} items: ${detail}`
+      );
+      error.ingest = parsed;
+      throw error;
+    }
+    return parsed;
   }
 
   async recallMemories(query, options = {}) {

@@ -150,11 +150,30 @@ export function buildContextString(label, result) {
   return lines.join("\n").trim();
 }
 
+// One unified chunk's body: its content, its enrichment, and every temporal
+// fact the query engaged (CONTRACT: chunks[].temporal is present only then,
+// and it is the dated version of the claim, so leaving it out would drop the
+// one thing that says when the content held).
+function pushUnifiedChunkLines(lines, chunk) {
+  if (chunk?.content) {
+    lines.push(truncateText(chunk.content, 700));
+  }
+  if (chunk?.enrichment?.text) {
+    lines.push(`Enrichment: ${truncateText(chunk.enrichment.text, 280)}`);
+  }
+  for (const fact of Array.isArray(chunk?.temporal) ? chunk.temporal : []) {
+    if (fact?.content) {
+      lines.push(`Temporal: ${truncateText(fact.content, 280)}`);
+    }
+  }
+}
+
 // A unified recall rendered from its structured fields (CONTRACT: chunks[]
-// context_id/score/content/enrichment, relations[], graph[] path_summary), in
-// the same [n] / [Rn] / [Pn] labelling the server's llm_prompt uses. This is
-// the human-readable form for `query` text output, and the fallback for the
-// injected block only when a server sent no llm_prompt.
+// context_id/score/content/enrichment/temporal, relations[], graph[]
+// path_summary), in the same [n] / [Rn] / [Pn] labelling the server's
+// llm_prompt uses. This is the human-readable form for `query` text output,
+// and the fallback for the injected block only when a server sent no
+// llm_prompt.
 export function buildUnifiedStructuredString(result) {
   const lines = [];
 
@@ -164,12 +183,7 @@ export function buildUnifiedStructuredString(result) {
     chunks.forEach((chunk, index) => {
       const score = typeof chunk.score === "number" ? ` (score ${chunk.score.toFixed(2)})` : "";
       lines.push(`[${index + 1}] context_id: ${chunk.contextId || "(unknown)"}${score}`);
-      if (chunk.content) {
-        lines.push(truncateText(chunk.content, 700));
-      }
-      if (chunk.enrichment?.text) {
-        lines.push(`Enrichment: ${truncateText(chunk.enrichment.text, 280)}`);
-      }
+      pushUnifiedChunkLines(lines, chunk);
       lines.push("");
     });
   }
@@ -180,9 +194,7 @@ export function buildUnifiedStructuredString(result) {
     relations.forEach((entry, index) => {
       const via = entry.via?.from ? ` (via ${entry.via.from})` : "";
       lines.push(`[R${index + 1}] context_id: ${entry.chunk?.contextId || "(unknown)"}${via}`);
-      if (entry.chunk?.content) {
-        lines.push(truncateText(entry.chunk.content, 700));
-      }
+      pushUnifiedChunkLines(lines, entry.chunk);
       lines.push("");
     });
   }
