@@ -49,6 +49,7 @@ export const DEFAULTS = {
   ingestionMode: "memory",
   recallMode: "fast",
   graphContext: true,
+  followForcefulRelations: true,
   maxContextChars: 7000,
   maxMemoryResults: 6,
   maxKnowledgeResults: 4,
@@ -78,6 +79,7 @@ const KNOWN_KEYS = new Set([
   "ingestionMode",
   "recallMode",
   "graphContext",
+  "followForcefulRelations",
   "maxContextChars",
   "maxMemoryResults",
   "maxKnowledgeResults",
@@ -363,6 +365,7 @@ export async function loadConfig(cwd, dataDir) {
     autoRecall: parseEnvBoolean("HYDRADB_AUTO_RECALL", errors),
     autoIngest: parseEnvBoolean("HYDRADB_AUTO_INGEST", errors),
     graphContext: parseEnvBoolean("HYDRADB_GRAPH_CONTEXT", errors),
+    followForcefulRelations: parseEnvBoolean("HYDRADB_FOLLOW_FORCEFUL_RELATIONS", errors),
     debug: parseEnvBoolean("HYDRADB_DEBUG", errors),
     maxContextChars: parseEnvNumber("HYDRADB_MAX_CONTEXT_CHARS"),
     maxMemoryResults: parseEnvNumber("HYDRADB_MAX_MEMORY_RESULTS"),
@@ -434,6 +437,15 @@ export async function loadConfig(cwd, dataDir) {
     ),
     recallMode: merged.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: parseBoolean(merged.graphContext, DEFAULTS.graphContext, errors, "graphContext"),
+    // PRO-1618: whether a unified recall follows the forceful relations the
+    // caller declared at ingest (the relations[] bucket of the response). Sent
+    // only to a unified database; a split one has no such field.
+    followForcefulRelations: parseBoolean(
+      merged.followForcefulRelations,
+      DEFAULTS.followForcefulRelations,
+      errors,
+      "followForcefulRelations"
+    ),
     maxContextChars: parseNumber(
       merged.maxContextChars,
       DEFAULTS.maxContextChars,
@@ -585,6 +597,7 @@ export function formatStatus(configResult, state) {
       ingestionMode: config.ingestionMode,
       recallMode: config.recallMode,
       graphContext: config.graphContext,
+      followForcefulRelations: config.followForcefulRelations,
       maxContextChars: config.maxContextChars,
       maxMemoryResults: config.maxMemoryResults,
       maxKnowledgeResults: config.maxKnowledgeResults,

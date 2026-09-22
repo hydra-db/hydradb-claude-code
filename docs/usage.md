@@ -130,7 +130,7 @@ Use this when you want automatic recall and sync, but no automatic memory writes
 - `knowledge`: recall knowledge only
 - `unified` / `auto`: explicit spellings; `auto` means `memory` on a split database
 
-On a unified database (created with `type: "unified"`, see `hydradb-api-info/unified-databases.md`) this knob is ignored: there is one corpus, and the plugin recalls it as a single `CONTEXT` section and ingests everything through the unified `items[]` body. The layout is read once from `GET /databases`.
+On a unified database (created with `type: "unified"`, see `hydradb-api-info/unified-databases.md`) this knob is ignored: there is one corpus, the plugin sends no `type`, recalls it through the four-key query response and injects the server-built `llm_prompt` (with its citation labels) as the context, and ingests everything through the unified JSON body whose list key is `context`. The layout is read once from `GET /databases`.
 
 ### `ingestionMode`
 
@@ -139,6 +139,10 @@ On a unified database (created with `type: "unified"`, see `hydradb-api-info/uni
 - `auto`: prefer memory, but fall back to knowledge for larger files
 
 If you use `ingestionMode: "auto"`, pair it with `searchMode: "both"` so auto recall can see both storage paths.
+
+### `followForcefulRelations`
+
+Unified databases only (default `true`): whether recall follows the forceful relations declared at ingest, so the response's `relations[]` and the `[R1]` entries of `llm_prompt` are filled. A split database has no such field and is never sent it.
 
 ## 4. Network timeout controls
 
@@ -224,6 +228,8 @@ On each user prompt, the plugin can inject a bounded `<hydradb-context>` block c
 - entity path chains from graph context
 - chunk-level graph relations
 - extra linked context when HydraDB returns it
+
+On a unified database the block is instead the server-built `llm_prompt` from the four-key query response, injected verbatim (secret redaction and the `maxContextChars` budget still apply). It already carries context, related context and graph paths with citation labels (`[1]`, `[R1]`, `[P1]`), so nothing is rebuilt from the chunks.
 
 This content is explicitly framed as reference material, not as new instructions.
 

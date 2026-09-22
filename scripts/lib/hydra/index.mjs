@@ -225,10 +225,11 @@ export function createHydraWrapper({
     }
   }
 
-  // PRO-1618: the vendored SDK predates `items` on ingest, `type` on database
-  // create and `details[]` on the database list, and it drops fields it does
-  // not know. Those three calls go over the wire by hand, through the same
-  // envelope unwrap and error translation, until the SDK is regenerated.
+  // PRO-1618: the vendored SDK predates the unified `context[]` ingest body,
+  // `type` on database create and `details[]` on the database list, and it
+  // drops fields it does not know. Those calls go over the wire by hand,
+  // through the same envelope unwrap and error translation, until the SDK is
+  // regenerated.
   const rawFetch = fetchImpl ?? globalThis.fetch;
   const rawBase = baseUrl.replace(/\/+$/g, "");
   async function rawJson(label, method, path, body, timeoutMs) {
@@ -267,10 +268,13 @@ export function createHydraWrapper({
     }
     return parsed;
   }
-  // The generated client's REQUEST serializers reject `type: "unified"`
-  // before anything is sent (their enum predates PRO-1618), so every call
-  // that names that kind is built by hand. The wire is already snake_case,
-  // which is the shape the plugin normalises everything to anyway.
+  // `kind: "unified"` is the plugin's INTERNAL selector for the unified
+  // database layout. It never reaches the wire: the contract says a unified
+  // database is sent no `type` at all (absent is its default; knowledge and
+  // memory are refused). Every call that carries it is built by hand because
+  // the generated client's serializers would either reject the value or add a
+  // split-era field. The wire is already snake_case, which is the shape the
+  // plugin normalises everything to anyway.
   const unifiedKind = (args) => args.kind === "unified";
 
   function requestOptions(timeoutMs) {
@@ -301,17 +305,22 @@ export function createHydraWrapper({
     async query(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       if (unifiedKind(args)) {
+        // CONTRACT (POST /query on a unified database): the v2 request fields
+        // and NO `type`; follow_forceful_relations selects the relations[]
+        // bucket of the four-key response.
         return unwrapAndNormalize(
           await rawJson("/query", "POST", "/query", {
             ...contextScope(),
             query: args.query,
-            type: "unified",
             ...(args.operator ? { operator: args.operator } : {}),
             ...(args.mode ? { mode: args.mode } : {}),
             ...(args.maxResults != null ? { max_results: args.maxResults } : {}),
             ...(args.alpha != null ? { alpha: args.alpha } : {}),
             ...(args.recencyBias != null ? { recency_bias: args.recencyBias } : {}),
-            ...(args.graphContext != null ? { graph_context: args.graphContext } : {})
+            ...(args.graphContext != null ? { graph_context: args.graphContext } : {}),
+            ...(args.followForcefulRelations != null
+              ? { follow_forceful_relations: Boolean(args.followForcefulRelations) }
+              : {})
           }, timeoutMs)
         );
       }
@@ -333,15 +342,20 @@ export function createHydraWrapper({
 
     async ingest(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
-      if (args.items != null) {
-        // The unified shape (PRO-1618): items[], each text or a conversation,
-        // no corpus selector. On a split database they land in the memory
-        // corpus; on a unified database they are the only shape accepted.
+      if (args.context != null) {
+        // The unified JSON body (CONTRACT: POST /context/ingest on a unified
+        // database). The list key is `context` (the server also accepts the
+        // `items` and `contexts` aliases; the contract says send `context`),
+        // each entry is text or a conversation, there is no corpus selector,
+        // and enrich/upsert/instructions are the request-level defaults for
+        // the items.
         return unwrapAndNormalize(
           await rawJson("/context/ingest", "POST", "/context/ingest", {
             ...contextScope(),
-            items: args.items,
-            ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {})
+            context: args.context,
+            ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {}),
+            ...(args.enrich != null ? { enrich: Boolean(args.enrich) } : {}),
+            ...(args.instructions != null ? { instructions: String(args.instructions) } : {})
           }, timeoutMs)
         );
       }
@@ -370,8 +384,9 @@ export function createHydraWrapper({
     async list(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       if (unifiedKind(args)) {
+        // CONTRACT: unchanged shape, and no `type` on a unified database.
         return unwrapAndNormalize(
-          await rawJson("/context/list", "POST", "/context/list", { ...contextScope(), type: "unified" }, timeoutMs)
+          await rawJson("/context/list", "POST", "/context/list", { ...contextScope() }, timeoutMs)
         );
       }
       const request = { ...contextScope(), ...(args.kind ? { type: args.kind } : {}) };
@@ -400,7 +415,8 @@ export function createHydraWrapper({
     async relations(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       if (unifiedKind(args)) {
-        const params = new URLSearchParams({ ...contextScope(), type: "unified", ...(args.id ? { id: args.id } : {}) });
+        // CONTRACT: unchanged shape, and no `type` on a unified database.
+        const params = new URLSearchParams({ ...contextScope(), ...(args.id ? { id: args.id } : {}) });
         return unwrapAndNormalize(
           await rawJson("/context/relations", "GET", `/context/relations?${params.toString()}`, undefined, timeoutMs)
         );
@@ -421,12 +437,15 @@ export function createHydraWrapper({
     async delete(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
       const requestedIds = Array.isArray(args.ids) ? args.ids : [];
+      const unified = unifiedKind(args);
       const request = {
         ...contextScope(),
         ids: args.ids,
-        ...(args.kind ? { type: args.kind } : {})
+        // A split database selects the corpus with `type`; a unified database
+        // has no corpus to select and is not sent one (CONTRACT).
+        ...(args.kind && !unified ? { type: args.kind } : {})
       };
-      const envelope = unifiedKind(args)
+      const envelope = unified
         ? await rawJson("/context (delete)", "DELETE", "/context", request, timeoutMs)
         : await call("/context (delete)", timeoutMs, () => client.context.delete(request, requestOptions(timeoutMs)));
       const data = unwrapAndNormalize(envelope) ?? {};

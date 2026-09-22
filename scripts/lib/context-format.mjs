@@ -150,16 +150,85 @@ export function buildContextString(label, result) {
   return lines.join("\n").trim();
 }
 
+// A unified recall rendered from its structured fields (CONTRACT: chunks[]
+// context_id/score/content/enrichment, relations[], graph[] path_summary), in
+// the same [n] / [Rn] / [Pn] labelling the server's llm_prompt uses. This is
+// the human-readable form for `query` text output, and the fallback for the
+// injected block only when a server sent no llm_prompt.
+export function buildUnifiedStructuredString(result) {
+  const lines = [];
+
+  const chunks = Array.isArray(result?.chunks) ? result.chunks : [];
+  if (chunks.length) {
+    lines.push("=== CONTEXT ===");
+    chunks.forEach((chunk, index) => {
+      const score = typeof chunk.score === "number" ? ` (score ${chunk.score.toFixed(2)})` : "";
+      lines.push(`[${index + 1}] context_id: ${chunk.contextId || "(unknown)"}${score}`);
+      if (chunk.content) {
+        lines.push(truncateText(chunk.content, 700));
+      }
+      if (chunk.enrichment?.text) {
+        lines.push(`Enrichment: ${truncateText(chunk.enrichment.text, 280)}`);
+      }
+      lines.push("");
+    });
+  }
+
+  const relations = Array.isArray(result?.relations) ? result.relations : [];
+  if (relations.length) {
+    lines.push("=== RELATED CONTEXT ===");
+    relations.forEach((entry, index) => {
+      const via = entry.via?.from ? ` (via ${entry.via.from})` : "";
+      lines.push(`[R${index + 1}] context_id: ${entry.chunk?.contextId || "(unknown)"}${via}`);
+      if (entry.chunk?.content) {
+        lines.push(truncateText(entry.chunk.content, 700));
+      }
+      lines.push("");
+    });
+  }
+
+  const graph = Array.isArray(result?.graph) ? result.graph : [];
+  if (graph.length) {
+    lines.push("=== GRAPH ===");
+    graph.forEach((path, index) => {
+      if (path.pathSummary) {
+        lines.push(`[P${index + 1}] ${path.pathSummary}`);
+      }
+      const chain = formatPathChain(path);
+      if (chain) {
+        lines.push(`    ${chain}`);
+      }
+    });
+  }
+
+  return lines.join("\n").trim();
+}
+
+// What the model sees for a unified recall: the server-built llm_prompt, as it
+// came. It carries the citation labels ([1], [R1], [P1]) the model is told to
+// cite, so it is never re-formatted here; the only touches are the secret
+// redaction applied at normalisation and the block budget below. The
+// structured rendering is used only if a server sent no prompt at all, so a
+// result is never silently dropped.
+export function buildUnifiedContextString(result) {
+  if (!result || typeof result !== "object") {
+    return "";
+  }
+  const llmPrompt = typeof result.llmPrompt === "string" ? result.llmPrompt : "";
+  if (llmPrompt.trim()) {
+    return llmPrompt;
+  }
+  return buildUnifiedStructuredString(result);
+}
+
 export function buildHydraContextBlock({ query, unified, memory, knowledge, errors, maxContextChars }) {
   const sections = [];
 
-  // PRO-1618: a unified database answers with one ranked list, rendered as a
-  // single CONTEXT section rather than a MEMORY/KNOWLEDGE split.
-  if (unified?.chunks?.length || unified?.queryPaths?.length || unified?.graphContext?.queryPathsDetailed?.length) {
-    const section = buildSection("CONTEXT", unified);
-    if (section) {
-      sections.push(section);
-    }
+  // PRO-1618: a unified database answers with the four-key body; the section
+  // is its llm_prompt, verbatim, in place of the MEMORY/KNOWLEDGE split.
+  const unifiedSection = buildUnifiedContextString(unified);
+  if (unifiedSection) {
+    sections.push(unifiedSection);
   }
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {

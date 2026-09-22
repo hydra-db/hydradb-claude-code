@@ -11,6 +11,7 @@
   "ingestionMode": "memory",
   "recallMode": "thinking",
   "graphContext": true,
+  "followForcefulRelations": true,
   "maxContextChars": 7000,
   "maxMemoryResults": 6,
   "maxKnowledgeResults": 4,

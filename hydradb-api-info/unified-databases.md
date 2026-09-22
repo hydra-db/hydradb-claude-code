@@ -1,12 +1,12 @@
 # Unified databases (PRO-1618)
 
-A database created with `type: "unified"` keeps knowledge and memory in ONE corpus. There is no new API version: the same v2 endpoints serve it, and `type` gained the value `unified`.
+A database created with `type: "unified"` keeps knowledge and memory in ONE corpus. There is no new API version: the same v2 endpoints serve it. What changes on it is the ingest body, the query response, and that `type` is never sent.
 
 ## What the plugin does
 
-- On startup it reads the configured database's layout once from `GET /databases` (`details[].type`). A failed probe reads as `split`, which is what every database created before this change is.
-- On a **unified** database every call sends `type: "unified"` (the only value the server accepts there; `memory`/`knowledge` are refused with a 400), recall is one ranked list rendered as a single `CONTEXT` section, and every write (turn capture, session upsert, `/hydradb-remember`, workspace sync) goes through the unified `items[]` body.
-- On a **split** database nothing changes: `searchMode`/`ingestionMode` behave exactly as before.
+- On startup it reads the configured database's layout once from `GET /databases` (`details[].type` is `"split"` or `"unified"`; absent means split). A failed probe reads as `split`, which is what every database created before this change is.
+- On a **unified** database the plugin sends no `type` on any call, writes every memory (turn capture, session upsert, `/hydradb:ingest --note`, workspace sync) through the JSON ingest body below, and injects the server-built `llm_prompt` from the four-key query response as the recall context.
+- On a **split** database nothing changes: the multipart ingest, `type` on every call, the MEMORY/KNOWLEDGE context block, and `searchMode`/`ingestionMode` behave exactly as before.
 
 ## Creating one
 
@@ -16,7 +16,9 @@ curl -X POST https://api.hydradb.com/databases \
   -d '{"database": "my-db", "type": "unified"}'
 ```
 
-## The `items[]` shape the plugin sends
+`POST /databases` is the one call that carries `type: "unified"`.
+
+## Ingest: the JSON body the plugin sends
 
 ```json
 POST /context/ingest
@@ -24,15 +26,17 @@ POST /context/ingest
   "database": "my-db",
   "collection": "claude-my-workspace",
   "upsert": true,
-  "items": [
-    { "context_id": "claude-turn:abc:1", "conversation": [
+  "context": [
+    { "context_id": "claude-turn:abc:1",
+      "conversation": [
         { "role": "user", "content": "...", "name": "Soham" },
         { "role": "assistant", "content": "..." } ],
-      "enrich": true, "custom_instructions": "..." },
-    { "context_id": "claude-chunk:abc:1", "title": "CLAUDE.md (part 1/2)", "text": "...",
-      "is_markdown": true, "user_name": "Soham", "enrich": true },
-    { "context_id": "claude-file:abc", "title": "CLAUDE.md", "text": "...",
-      "happened_at": "2026-09-05T10:00:00.000Z",
+      "enrich": true, "instructions": "Extract durable user preferences, ..." },
+    { "context_id": "claude-session:abc:memory", "title": "Claude Code session abc",
+      "text": "# Claude Code session\n...", "enrich": true, "instructions": "...",
+      "custom_attributes": { "is_markdown": true, "user_name": "Soham" } },
+    { "context_id": "claude-file:abc", "title": "CLAUDE.md", "text": "...", "enrich": true,
+      "happened_at": "2026-09-05",
       "attributes": { "workspace": "my-workspace", "relative_path": "CLAUDE.md", "extension": ".md" },
       "custom_attributes": { "size_bytes": 4096, "plugin": "hydradb",
         "source": "claude-code-plugin", "description": "Workspace context synced from my-workspace",
@@ -41,8 +45,59 @@ POST /context/ingest
 }
 ```
 
-A workspace file's `metadata` becomes `attributes` and its `additional_metadata` becomes `custom_attributes`; `timestamp` becomes `happened_at`. `source`, `description` and `url` have no field of their own on an item, so they ride in `custom_attributes` rather than being dropped — a synced file keeps the same provenance it has on a split database.
+The list key is `context`. Each item is exactly one of `text` or `conversation` (turns are `{role, content, name?}` with roles `user`, `assistant`, `system`). The item fields are the contract's: `context_id` (was `source_id`), `title`, `enrich` (was `infer`), `upsert`, `instructions` (was `custom_instructions`), `happened_at` (YYYY-MM-DD only; the workspace sync cuts it from the file's mtime), `attributes` (was `metadata`; declared, filterable), `custom_attributes` (was `additional_metadata`; free-form), `context_category`, `forceful_relations`, `acl`. `enrich`, `upsert` and `instructions` may also be given once at request level as the default for every item.
 
-Nothing the split lane carried is dropped on the way. `is_markdown` and `user_name` are on the item, the same two fields `MemoryItem` has always had, so a workspace file chunks and renders the same way and keeps its attribution whichever layout it lands on. A conversation's attribution rides on the per-turn `name` instead, which is what the server reads first.
+`is_markdown` and `user_name` are not item fields, so a text item carries them inside `custom_attributes`; a conversation's attribution is the per-turn `name`. A workspace file's `metadata` becomes `attributes`, its `additional_metadata` becomes `custom_attributes`, and `source`, `description` and `url` ride in `custom_attributes` too, so a synced file keeps the same provenance it has on a split database.
+
+The response is a 202:
+
+```json
+{ "success": true, "message": "...",
+  "results": [ { "source_id": "claude-turn:abc:1", "title": null, "status": "queued", "infer": true, "error": null, "error_code": null } ],
+  "success_count": 1, "failed_count": 0 }
+```
+
+inside the usual `{success, data, meta}` envelope. `results[].source_id` is the context id (the one sent, or the one the server generated when none was). `/hydradb:ingest --note` prints it, and `ingest --session --json` returns the queued ids as `contextIds`. Poll `GET /context/status?database=..&ids=..` for indexing progress.
+
+## Query: the request and the four-key response
+
+The plugin sends the v2 request (`database`, `collection`, `query`, `mode`, `max_results`, `alpha`, `recency_bias`, `graph_context`) plus `follow_forceful_relations` (config `followForcefulRelations`, default `true`), and no `type`.
+
+The response `data` has exactly four keys:
+
+```json
+{
+  "chunks": [
+    { "chunk_id": "ck_9f2", "context_id": "chat-2026-07-29#w2", "score": 0.87,
+      "content": "user: Keep answers short please\nassistant: Got it.",
+      "enrichment": { "text": "User prefers short, bullet-point answers.", "kind": "user_preference" },
+      "temporal": [ { "content": "...", "start_date": "2026-06-01", "end_date": null } ] }
+  ],
+  "graph": [
+    { "triplets": [ { "source": { "entity_id": "ent_a3f", "name": "John" },
+                      "relation": { "predicate": "subscribed to", "context": "John subscribed to the Pro plan.",
+                                    "temporal_details": "since June", "relationship_id": "rel_1", "chunk_id": "ck_9f2" },
+                      "target": { "entity_id": "ent_9c1", "name": "Pro plan" } } ],
+      "path_summary": "John is on the Pro plan since June 2026." }
+  ],
+  "relations": [
+    { "via": { "from": "linear-PRO-1169", "to": "linear-PRO-1169-comment-4" },
+      "chunk": { "chunk_id": "ck_7b3", "context_id": "linear-PRO-1169-comment-4", "score": 0.42, "content": "..." } }
+  ],
+  "llm_prompt": "=== CONTEXT ===\nCite anything you use from this context with its bracketed label, e.g. [1].\n\n[1] context_id: chat-2026-07-29#w2\n...\n=== RELATED CONTEXT ===\n[R1] ...\n=== GRAPH ===\n[P1] John is on the Pro plan since June 2026.\n    John -> subscribed to -> Pro plan [1]"
+}
+```
+
+What the plugin does with it:
+
+- The `<hydradb-context>` block injected on each prompt contains `llm_prompt` verbatim (secret redaction and the `maxContextChars` budget still apply). It carries the citation labels `[1]`, `[R1]`, `[P1]` the model is asked to cite, so the plugin never rebuilds it from the chunks.
+- `query --json` returns `searchMode: "unified"` and a `unified` object: `chunks[]` (`contextId`, `chunkId`, `score`, `content`, `enrichment{text,kind}`, `temporal[]`), `graph[]` (`pathSummary`, `triplets`), `relations[]` (`via{from,to}`, `chunk`) and `llmPrompt`. The text output renders the structured fields in the same `[n]` / `[Rn]` / `[Pn]` labelling.
+- `/hydradb:last-recall` reports `unifiedCount`, `unifiedGraphPathCount` and `unifiedRelationCount` for a unified recall.
+- Chunks carry nothing about their source (no title, url, collection or timestamps). Use `GET /context/inspect?database=..&id=<context_id>` for that.
+- The parser tells the two shapes apart by shape (`graph` is an array and `llm_prompt` a string, versus `graph_context` and `chunk_content`), never by a flag, because split databases and stored logs keep producing the old shape.
+
+## Other endpoints
+
+`POST /context/list`, `DELETE /context`, `GET /context/relations`, `GET /context/inspect`, `GET /context/status`: unchanged shapes, and the plugin sends no `type` to a unified database on any of them.
 
 `searchMode: "unified"` and `ingestionMode: "unified"` are accepted as explicit spellings, and `searchMode: "auto"` means `memory` on a split database; the layout always wins.

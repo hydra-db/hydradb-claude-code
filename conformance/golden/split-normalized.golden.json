@@ -1,0 +1,83 @@
+{
+  "chunks": [
+    {
+      "title": "README.md",
+      "sourceTitle": "README.md",
+      "text": "workspace overview: build with make smoke",
+      "score": 0.5,
+      "sourceId": "s1",
+      "chunkUuid": "c1",
+      "extraContextIds": [
+        "x1"
+      ],
+      "relations": [
+        "depends_on"
+      ]
+    },
+    {
+      "title": "CLAUDE.md",
+      "sourceTitle": "CLAUDE.md",
+      "text": "# Smoke\nBuild with `make smoke`.",
+      "score": 0.4,
+      "sourceId": "s2",
+      "chunkUuid": "c2",
+      "extraContextIds": [],
+      "relations": []
+    }
+  ],
+  "queryPaths": [
+    "{\"triplets\":[{\"source\":{\"name\":\"plugin\"},\"relation\":{\"canonical_predicate\":\"syncs\",\"context\":\"syncs markdown docs\",\"temporal_details\":\"since v1\"},\"target\":{\"...",
+    "a -> b"
+  ],
+  "graphContext": {
+    "queryPathsDetailed": [
+      {
+        "triplets": [
+          {
+            "source": {
+              "name": "plugin"
+            },
+            "relation": {
+              "canonical_predicate": "syncs",
+              "context": "syncs markdown docs",
+              "temporal_details": "since v1"
+            },
+            "target": {
+              "name": "HydraDB"
+            }
+          }
+        ]
+      },
+      "a -> b"
+    ],
+    "chunkRelations": [
+      {
+        "groupId": "g1",
+        "triplets": [
+          {
+            "source": {
+              "name": "a"
+            },
+            "relation": {
+              "canonical_predicate": "rel"
+            },
+            "target": {
+              "name": "b"
+            }
+          }
+        ]
+      }
+    ],
+    "chunkIdToGroupIds": {
+      "c1": [
+        "g1"
+      ]
+    }
+  },
+  "additionalContext": {
+    "x1": {
+      "source_title": "notes.md",
+      "chunk_content": "detail about smoke"
+    }
+  }
+}

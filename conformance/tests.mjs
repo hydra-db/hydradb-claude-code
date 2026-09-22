@@ -11,15 +11,19 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { buildHydraContextBlock } from "../scripts/lib/context-format.mjs";
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import {
   appKnowledgeToItem,
+  EMPTY_UNIFIED_RECALL,
   HydraClient,
   isUnifiedLayoutRefusal,
   memoryToItem,
-  normalizeRetrievalResponse
+  normalizeRetrievalResponse,
+  parseUnifiedIngestResponse
 } from "../scripts/lib/hydra-client.mjs";
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
+import { SPLIT_QUERY_RESPONSE, UNIFIED_QUERY_RESPONSE } from "./fixtures.mjs";
 
 function fakeResponse(payload) {
   // A responder may name the HTTP status through `__status` (default 200),
@@ -62,6 +66,7 @@ function capturingFetch(sink, responder) {
       init.headers && typeof init.headers.get === "function" ? init.headers.get("content-type") : undefined;
     const record = {
       path: parsed.pathname,
+      search: parsed.searchParams,
       httpMethod,
       isFormData,
       contentType: isFormData ? "multipart/form-data" : headerCt || (bodyString ? "application/json" : undefined),
@@ -340,32 +345,100 @@ export async function runHttpTests() {
     assert.equal(inspect.chunk_content, "body");
   }
 
-  // 10) PRO-1618: unified recall is a hand-built POST /query with type=unified
-  //     (the vendored SDK's request serializer rejects the value), and the
-  //     result goes through the same snake_case seam.
+  // 10) PRO-1618: unified recall is a hand-built POST /query with NO `type`
+  //     (CONTRACT: absent is the unified default; knowledge/memory are 400),
+  //     carrying follow_forceful_relations, and the four-key body it answers
+  //     with is parsed by shape into chunks/graph/relations/llmPrompt.
   {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
-      fetch: capturingFetch(sink, () => ({
-        data: { chunks: [{ chunk_uuid: "c1", chunk_content: "body", source_title: "T" }] },
-        success: true
-      }))
+      fetch: capturingFetch(sink, () => ({ data: UNIFIED_QUERY_RESPONSE, success: true }))
     });
-    const res = await client.recallUnified("acme");
+    const res = await client.recallUnified("acme", { followForcefulRelations: true });
     const req = sink.at(-1);
     assert.equal(req.path, "/query");
     assert.equal(req.httpMethod, "POST");
     assert.equal(req.contentType, "application/json");
     const body = JSON.parse(req.bodyString);
-    assert.equal(body.type, "unified");
+    assert.ok(!("type" in body), "a unified database is never sent `type`");
     assert.equal(body.database, "db_test");
     assert.equal(body.collection, "col_test");
-    assert.equal(res.chunks[0].text, "body");
+    assert.equal(body.query, "acme");
+    assert.equal(body.graph_context, true);
+    assert.equal(body.follow_forceful_relations, true);
+
+    assert.equal(res.layout, "unified");
+    assert.equal(res.llmPrompt, UNIFIED_QUERY_RESPONSE.llm_prompt, "llm_prompt is kept whole");
+    assert.equal(res.chunks.length, 2);
+    assert.deepEqual(res.chunks[0], {
+      contextId: "chat-2026-07-29#w2",
+      chunkId: "ck_9f2",
+      score: 0.87,
+      content: "user: Keep answers short please\nassistant: Got it.",
+      enrichment: { text: "User prefers short, bullet-point answers.", kind: "user_preference" }
+    });
+    assert.deepEqual(res.chunks[1].temporal, [
+      {
+        content: "Refund window was 14 days. Start: 2025-01-01, End: 2026-06-30",
+        startDate: "2025-01-01",
+        endDate: "2026-06-30"
+      }
+    ]);
+    assert.ok(!("enrichment" in res.chunks[1]), "enrichment is absent when the server sent none");
+    assert.equal(res.graph.length, 1);
+    assert.equal(res.graph[0].pathSummary, "John is on the Pro plan since June 2026.");
+    assert.equal(res.graph[0].triplets[0].relation.canonical_predicate, "subscribed to");
+    assert.deepEqual(res.relations[0].via, { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" });
+    assert.equal(res.relations[0].chunk.contextId, "linear-PRO-1169-comment-4");
+    assert.equal(res.relations[0].chunk.content, "Comment 4: shipped the fix in #1625.");
+    for (const key of ["chunk_content", "graph_context", "sources", "additional_context"]) {
+      assert.ok(!(key in res), `no split-era key ${key} on a unified result`);
+    }
   }
 
-  // 11) Unified delete is a hand-built DELETE /context with type=unified, and
-  //     the per-id classification still sees the envelope.
+  // 10b) The shape decides, not a flag: the SAME normalizer given the v2 shape
+  //      takes the legacy path (chunk_content, graph_context), so a split
+  //      database and a stored log keep reading exactly as before.
+  {
+    const split = normalizeRetrievalResponse(SPLIT_QUERY_RESPONSE);
+    assert.ok(!("layout" in split) && !("llmPrompt" in split), "a split response never grows unified keys");
+    assert.equal(split.chunks[0].text, "workspace overview: build with make smoke");
+    assert.equal(split.chunks[0].sourceTitle, "README.md");
+    const unifiedNoChunks = normalizeRetrievalResponse({ ...UNIFIED_QUERY_RESPONSE, chunks: [] });
+    assert.equal(unifiedNoChunks.layout, "unified", "graph[] plus llm_prompt is the unified shape even with no chunks");
+  }
+
+  // 10c) What the model sees on a unified database is the llm_prompt verbatim,
+  //      citation labels included, and none of the MEMORY/KNOWLEDGE template.
+  {
+    const unified = normalizeRetrievalResponse(UNIFIED_QUERY_RESPONSE);
+    const empty = { chunks: [], queryPaths: [], graphContext: {}, additionalContext: {} };
+    const block = buildHydraContextBlock({
+      query: "what plan is John on",
+      unified,
+      memory: empty,
+      knowledge: empty,
+      errors: [],
+      maxContextChars: 7000
+    });
+    assert.ok(block.startsWith("<hydradb-context>\n"));
+    assert.ok(block.includes(`\n${UNIFIED_QUERY_RESPONSE.llm_prompt}\n`), "llm_prompt is injected verbatim");
+    for (const label of ["[1]", "[2]", "[R1]", "[P1]"]) {
+      assert.ok(block.includes(label), `citation label ${label} survives`);
+    }
+    assert.ok(!/=== (MEMORY|KNOWLEDGE) /.test(block), "no split-era section headers");
+    assert.ok(!/Chunk 1\nSource:/.test(block), "the chunk template is not rebuilt around the prompt");
+    assert.equal(
+      buildHydraContextBlock({ query: "q", unified: EMPTY_UNIFIED_RECALL, memory: empty, knowledge: empty, errors: [] }),
+      "",
+      "an empty unified recall injects nothing"
+    );
+  }
+
+  // 11) Unified delete is a hand-built DELETE /context with NO `type`
+  //     (CONTRACT: unchanged shape, send nothing), and the per-id
+  //     classification still sees the envelope.
   {
     const sink = [];
     const client = new HydraClient({
@@ -377,13 +450,16 @@ export async function runHttpTests() {
     assert.equal(req.path, "/context");
     assert.equal(req.httpMethod, "DELETE");
     const body = JSON.parse(req.bodyString);
-    assert.equal(body.type, "unified");
+    assert.ok(!("type" in body), "a unified delete carries no `type`");
     assert.deepEqual(body.ids, ["item-1"]);
+    assert.equal(body.collection, "col_test");
     assert.deepEqual(result.deletedIds, ["item-1"]);
   }
 
-  // 12) On a unified database every memory write becomes the items[] JSON
-  //     body after one layout probe; the split-era `memories` field is never sent.
+  // 12) On a unified database every memory write becomes the unified JSON
+  //     body after one layout probe: list key `context` (never `items`, never
+  //     `memories`), the contract's item fields, no `type`. Pinned as the
+  //     EXACT body for both item shapes, and the 202 is parsed.
   {
     const sink = [];
     const client = new HydraClient({
@@ -391,17 +467,95 @@ export async function runHttpTests() {
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases"
           ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
-          : { data: { success_count: 1, failed_count: 0 }, success: true }
+          : {
+              data: {
+                success: true,
+                message: "queued",
+                results: [{ source_id: "m1", title: "Prefs", status: "queued", infer: true, error: null, error_code: null }],
+                success_count: 1,
+                failed_count: 0
+              },
+              success: true
+            }
       )
     });
-    await client.addMemories([{ text: "the user prefers dark mode", infer: true, source_id: "m1" }]);
+    const stored = await client.addTextMemory("the user prefers dark mode", {
+      title: "Prefs",
+      userName: "Ada",
+      isMarkdown: true,
+      customInstructions: "focus",
+      sourceId: "m1"
+    });
     assert.equal(sink[0].path, "/databases", "the layout is probed once, first");
     const req = sink.at(-1);
     assert.equal(req.path, "/context/ingest");
-    assert.equal(req.contentType, "application/json", "unified ingest is the JSON items[] body");
-    const body = JSON.parse(req.bodyString);
-    assert.deepEqual(body.items, [{ text: "the user prefers dark mode", context_id: "m1", enrich: true }]);
-    assert.ok(!("memories" in body));
+    assert.equal(req.httpMethod, "POST");
+    assert.equal(req.contentType, "application/json", "unified ingest is the JSON body");
+    assert.deepEqual(JSON.parse(req.bodyString), {
+      database: "db_test",
+      collection: "col_test",
+      context: [
+        {
+          text: "the user prefers dark mode",
+          context_id: "m1",
+          title: "Prefs",
+          enrich: true,
+          instructions: "focus",
+          custom_attributes: { is_markdown: true, user_name: "Ada" }
+        }
+      ],
+      upsert: true
+    });
+    assert.deepEqual(stored.contextIds, ["m1"], "results[].source_id is the context id");
+    assert.equal(stored.successCount, 1);
+    assert.equal(stored.failedCount, 0);
+    assert.deepEqual(stored.failed, []);
+
+    await client.addConversationMemory("I prefer dark mode", "Noted", {
+      userName: "Ada",
+      customInstructions: "focus",
+      sourceId: "claude-turn:1"
+    });
+    assert.deepEqual(JSON.parse(sink.at(-1).bodyString), {
+      database: "db_test",
+      collection: "col_test",
+      context: [
+        {
+          conversation: [
+            { role: "user", content: "I prefer dark mode", name: "Ada" },
+            { role: "assistant", content: "Noted" }
+          ],
+          context_id: "claude-turn:1",
+          enrich: true,
+          instructions: "focus"
+        }
+      ],
+      upsert: true
+    });
+    assert.equal(sink.filter((entry) => entry.path === "/databases").length, 1, "the layout is cached for the process");
+  }
+
+  // 12b) The 202 parser: a failed item is reported by context id with its
+  //      error, and the counts come from the server when it sends them.
+  {
+    const parsed = parseUnifiedIngestResponse({
+      success: false,
+      message: "1 of 2 queued",
+      results: [
+        { source_id: "ok-1", title: null, status: "queued", infer: false, error: null, error_code: null },
+        { source_id: "bad-2", title: "Bad", status: "failed", infer: true, error: "text too large", error_code: "ITEM_TOO_LARGE" }
+      ],
+      success_count: 1,
+      failed_count: 1
+    });
+    assert.deepEqual(parsed.contextIds, ["ok-1"]);
+    assert.equal(parsed.successCount, 1);
+    assert.equal(parsed.failedCount, 1);
+    assert.deepEqual(parsed.failed, [
+      { contextId: "bad-2", title: "Bad", status: "failed", enrich: true, error: "text too large", errorCode: "ITEM_TOO_LARGE" }
+    ]);
+    assert.equal(parsed.success, false);
+    assert.equal(parsed.message, "1 of 2 queued");
   }
 
   // 13) A probe that fails reads as split, and when the server then names the
@@ -425,7 +579,8 @@ export async function runHttpTests() {
       })
     });
     await client.addMemories([{ text: "note" }]);
-    assert.equal(sink.at(-1).contentType, "application/json", "retried as the unified items[] body");
+    assert.equal(sink.at(-1).contentType, "application/json", "retried as the unified context[] body");
+    assert.deepEqual(JSON.parse(sink.at(-1).bodyString).context, [{ text: "note", enrich: true }]);
     assert.equal(await client.isUnified(), true, "the refusal pins the layout for later calls");
   }
 
@@ -453,15 +608,16 @@ export async function runHttpTests() {
       { id: "claude-file:a", title: "CLAUDE.md", content: { text: "# Smoke" } }
     ]);
     const req = sink.at(-1);
-    assert.equal(req.contentType, "application/json", "knowledge retries as the unified items[] body too");
-    assert.deepEqual(JSON.parse(req.bodyString).items, [
+    assert.equal(req.contentType, "application/json", "knowledge retries as the unified context[] body too");
+    assert.deepEqual(JSON.parse(req.bodyString).context, [
       { text: "# Smoke", enrich: true, context_id: "claude-file:a", title: "CLAUDE.md" }
     ]);
     assert.equal(await client.isUnified(), true, "the knowledge refusal pins the layout too");
   }
 
   // 13c) The ingest-body wording of the same refusal ("this database is
-  //      unified: send the content as `items`") is the one the old
+  //      unified: send the content as `items`", the server names its alias)
+  //      is the one the old
   //      /unified database/i pattern missed entirely, and the retry is pinned
   //      only once it has actually succeeded.
   {
@@ -518,7 +674,7 @@ export async function runHttpTests() {
       { id: "claude-file:empty", title: "EMPTY.md", content: { text: "   " } },
       { id: "claude-file:real", title: "CLAUDE.md", content: { text: "# Smoke" } }
     ]);
-    const items = JSON.parse(sink.at(-1).bodyString).items;
+    const items = JSON.parse(sink.at(-1).bodyString).context;
     assert.equal(items.length, 1, "the empty record is skipped, not sent");
     assert.equal(items[0].context_id, "claude-file:real");
   }
@@ -526,7 +682,8 @@ export async function runHttpTests() {
   // 13e) The workspace-sync knowledge record keeps everything its producer set.
   //      appKnowledgeToItem used to read tenant_metadata/app_metadata, which
   //      buildKnowledgeItem never emits, so a synced file arrived on a unified
-  //      database as bare text plus a context_id.
+  //      database as bare text plus a context_id. The ISO mtime becomes the
+  //      contract's YYYY-MM-DD happened_at.
   {
     const item = appKnowledgeToItem({
       id: "claude-file:abc",
@@ -544,7 +701,7 @@ export async function runHttpTests() {
       enrich: true,
       context_id: "claude-file:abc",
       title: "CLAUDE.md",
-      happened_at: "2026-09-05T10:00:00.000Z",
+      happened_at: "2026-09-05",
       attributes: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
       custom_attributes: {
         size_bytes: 7,
@@ -556,20 +713,27 @@ export async function runHttpTests() {
     });
   }
 
-  // 13f) is_markdown and user_name are CARRIED, not dropped: the first changes
-  //      how the server chunks and renders, the second is the attribution, and
-  //      buildMemoryItems sets both on every workspace memory chunk.
+  // 13f) is_markdown and user_name are CARRIED, not dropped, but never as item
+  //      fields: the contract's item has neither, so both ride inside the
+  //      free-form custom_attributes. buildMemoryItems sets both on every
+  //      workspace memory chunk, and the rendering hint plus attribution still
+  //      arrive whichever layout the file lands on.
   {
     assert.deepEqual(memoryToItem({ text: "# Title", is_markdown: true, user_name: "Ada" }), {
       text: "# Title",
-      is_markdown: true,
-      user_name: "Ada",
-      enrich: true
+      enrich: true,
+      custom_attributes: { is_markdown: true, user_name: "Ada" }
     });
     assert.equal(
-      memoryToItem({ text: "note", is_markdown: false }).is_markdown,
+      memoryToItem({ text: "note", is_markdown: false }).custom_attributes.is_markdown,
       false,
       "an explicit false is still the caller's answer, not an absent field"
+    );
+    assert.deepEqual(
+      memoryToItem({ text: "n", is_markdown: true, document_metadata: JSON.stringify({ plugin: "hydradb" }) })
+        .custom_attributes,
+      { plugin: "hydradb", is_markdown: true },
+      "the caller's own custom_attributes are kept alongside"
     );
     // A conversation's attribution rides on the per-turn speaker name instead.
     const conversationItem = memoryToItem({
@@ -581,6 +745,10 @@ export async function runHttpTests() {
       { role: "assistant", content: "yo" }
     ]);
     assert.ok(!("user_name" in conversationItem), "a conversation does not repeat it at item level");
+    assert.ok(!("custom_attributes" in conversationItem), "and does not repeat it in custom_attributes");
+    for (const item of [memoryToItem({ text: "t", is_markdown: true, user_name: "Ada" }), conversationItem]) {
+      assert.ok(!("is_markdown" in item) && !("user_name" in item), "neither is ever an item field");
+    }
   }
 
   // 13g) CORPUS_TYPE_UNSUPPORTED covers three refusals and only one is ours.
@@ -705,7 +873,36 @@ export async function runHttpTests() {
     assert.equal(isUnifiedLayoutRefusal(viaDetail), true, "the code carries a refusal the regex cannot see");
   }
 
-  return { tests: 20 };
+  // 14) The other unified calls carry no `type` either (CONTRACT: list and
+  //     relations keep their shapes, send nothing), while database create is
+  //     the one place `type: "unified"` goes, because that is how one is made.
+  {
+    const sink = [];
+    const wrapper = createHydraWrapper({
+      apiKey: "k",
+      tenantId: "db_test",
+      subTenantId: "col_test",
+      baseUrl: "https://api.hydradb.test",
+      fetch: capturingFetch(sink, () => ({ data: {}, success: true }))
+    });
+    await wrapper.context.list({ kind: "unified" });
+    const list = sink.at(-1);
+    assert.equal(list.path, "/context/list");
+    assert.deepEqual(JSON.parse(list.bodyString), { database: "db_test", collection: "col_test" });
+
+    await wrapper.context.relations({ kind: "unified", id: "policy-1" });
+    const relations = sink.at(-1);
+    assert.equal(relations.path, "/context/relations");
+    assert.equal(relations.httpMethod, "GET");
+    assert.ok(!relations.search.has("type"), "the relations query string carries no `type`");
+    assert.equal(relations.search.get("id"), "policy-1");
+    assert.equal(relations.search.get("database"), "db_test");
+
+    await wrapper.databases.create({ database: "new_db", type: "unified" });
+    assert.deepEqual(JSON.parse(sink.at(-1).bodyString), { database: "new_db", type: "unified" });
+  }
+
+  return { tests: 24 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
@@ -722,6 +919,28 @@ function keyShape(value, prefix = "") {
       .flatMap((k) => keyShape(value[k], prefix ? `${prefix}.${k}` : k));
   }
   return [prefix];
+}
+
+// A whole-text golden, for outputs pinned byte-for-byte rather than by key
+// shape. Regenerated the same way, with UPDATE_GOLDEN=1, and reviewed as a diff.
+async function assertGoldenText(goldenDir, fileName, actual) {
+  const goldenPath = path.join(goldenDir, fileName);
+  if (process.env.UPDATE_GOLDEN === "1") {
+    await fs.mkdir(goldenDir, { recursive: true });
+    await fs.writeFile(goldenPath, actual, "utf8");
+    return;
+  }
+  let expected;
+  try {
+    expected = await fs.readFile(goldenPath, "utf8");
+  } catch {
+    throw new Error(`missing golden ${fileName}; regenerate with UPDATE_GOLDEN=1`);
+  }
+  assert.equal(
+    actual,
+    expected,
+    `${fileName} moved; if intended, regenerate with UPDATE_GOLDEN=1 and review the diff`
+  );
 }
 
 async function assertGolden(goldenDir, name, actualShape) {
@@ -782,6 +1001,33 @@ export async function runGoldenTests(root) {
   };
   await assertGolden(goldenDir, "query", keyShape(queryPayload));
 
+  // query --json on a UNIFIED database: the same envelope, searchMode
+  // "unified", and the four-key result under `unified` (llmPrompt included).
+  const emptyRecall = { chunks: [], queryPaths: [], graphContext: {}, additionalContext: {} };
+  const unifiedPayload = {
+    query: "sample",
+    searchMode: "unified",
+    unified: normalizeRetrievalResponse(UNIFIED_QUERY_RESPONSE),
+    memory: emptyRecall,
+    knowledge: emptyRecall,
+    errors: []
+  };
+  await assertGolden(goldenDir, "query-unified", keyShape(unifiedPayload));
+
+  // Split output is byte-for-byte what it was before the unified contract:
+  // both goldens were cut from the pre-contract code against the same fixture,
+  // so any diff here is a split regression, never an intended change.
+  const splitNormalized = normalizeRetrievalResponse(SPLIT_QUERY_RESPONSE);
+  await assertGoldenText(goldenDir, "split-normalized.golden.json", `${JSON.stringify(splitNormalized, null, 2)}\n`);
+  const splitBlock = buildHydraContextBlock({
+    query: "how do I build the plugin",
+    memory: splitNormalized,
+    knowledge: splitNormalized,
+    errors: [],
+    maxContextChars: 7000
+  });
+  await assertGoldenText(goldenDir, "split-context-block.golden.txt", `${splitBlock}\n`);
+
   // doctor/status --json shape, from a real CLI run against a seeded config.
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-golden-"));
   await fs.writeFile(
@@ -825,5 +1071,5 @@ export async function runGoldenTests(root) {
   ).trim();
   await assertGolden(goldenDir, "last-recall", keyShape(JSON.parse(lastRecallRaw)));
 
-  return { golden: 3 };
+  return { golden: 6 };
 }

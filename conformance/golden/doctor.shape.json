@@ -11,6 +11,7 @@
   "resolvedConfig.captureMode",
   "resolvedConfig.debug",
   "resolvedConfig.excludeGlobs[]",
+  "resolvedConfig.followForcefulRelations",
   "resolvedConfig.graphContext",
   "resolvedConfig.ignoreMarker",
   "resolvedConfig.includeGlobs[]",

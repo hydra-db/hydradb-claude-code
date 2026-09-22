@@ -15,7 +15,7 @@ Summarize:
 
 - whether auto-recall was skipped or executed
 - the skip reason, if any
-- how many memory and knowledge chunks were returned
+- how many memory and knowledge chunks were returned (on a unified database: `unifiedCount`, `unifiedGraphPathCount`, `unifiedRelationCount`)
 - whether an `additionalContext` block was emitted
 - any recall errors
 
