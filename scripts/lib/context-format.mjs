@@ -1,7 +1,13 @@
-import { truncateText, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
+import { normalizeText, truncateText, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 function safeString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+// PRO-1618: unified query text is never compacted. Line endings are
+// normalised and surrounding whitespace trimmed, nothing is cut.
+function wholeText(text) {
+  return normalizeText(text).trim();
 }
 
 function formatTriplet(triplet) {
@@ -156,7 +162,8 @@ export function buildContextString(label, result) {
 // fact the query engaged (CONTRACT: chunks[].temporal is present only then,
 // and it is the dated version of the claim, so leaving it out would drop the
 // one thing that says when the content held). Chunks carry no source title,
-// so the heading names the context_id.
+// so the heading names the context_id. Content, enrichment and temporal facts
+// are rendered whole, never truncated or summarised.
 function pushUnifiedChunkLines(lines, chunk, label, linkedFrom) {
   lines.push(`### ${label}. ${chunk?.contextId || "(unknown)"}`);
   const meta = [];
@@ -172,16 +179,16 @@ function pushUnifiedChunkLines(lines, chunk, label, linkedFrom) {
     lines.push(`- ${meta.join(" · ")}`);
   }
   if (chunk?.content) {
-    lines.push("", truncateText(chunk.content, 700));
+    lines.push("", wholeText(chunk.content));
   }
   if (chunk?.enrichment) {
-    lines.push("", `**Enrichment:** ${truncateText(chunk.enrichment, 280)}`);
+    lines.push("", `**Enrichment:** ${wholeText(chunk.enrichment)}`);
   }
   const temporal = (Array.isArray(chunk?.temporal) ? chunk.temporal : []).filter((fact) => fact?.content);
   if (temporal.length) {
     lines.push("");
     for (const fact of temporal) {
-      lines.push(`**Temporal:** ${truncateText(fact.content, 280)}`);
+      lines.push(`**Temporal:** ${wholeText(fact.content)}`);
     }
   }
   lines.push("");
@@ -261,10 +268,11 @@ export function buildUnifiedStructuredString(result) {
 // What the model sees for a unified recall: the server-built llm_prompt, as it
 // came. It is markdown and numbers what the model is told to cite (results
 // `### 1.`, forceful relations `### R1.`, related facts `[P1]`, cited in
-// brackets as [1] / [R1] / [P1]), so it is never re-formatted here; the only touches are the secret
-// redaction applied at normalisation and the block budget below. The
-// structured rendering is used only if a server sent no prompt at all, so a
-// result is never silently dropped.
+// brackets as [1] / [R1] / [P1]), so it is never re-formatted here and never
+// compacted: the only touch is the secret redaction applied at normalisation.
+// The maxContextChars budget does not apply to it (see buildHydraContextBlock).
+// The structured rendering is used only if a server sent no prompt at all, so
+// a result is never silently dropped.
 export function buildUnifiedContextString(result) {
   if (!result || typeof result !== "object") {
     return "";
@@ -280,11 +288,10 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
   const sections = [];
 
   // PRO-1618: a unified database answers with the four-key body; the section
-  // is its llm_prompt, verbatim, in place of the MEMORY/KNOWLEDGE split.
-  const unifiedSection = buildUnifiedContextString(unified);
-  if (unifiedSection) {
-    sections.push(unifiedSection);
-  }
+  // is its llm_prompt, verbatim, in place of the MEMORY/KNOWLEDGE split. It is
+  // injected whole: the maxContextChars budget below applies to the split
+  // MEMORY/KNOWLEDGE sections only.
+  const unifiedSection = wholeText(buildUnifiedContextString(unified));
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {
     const section = buildContextString("MEMORY", memory);
@@ -304,7 +311,7 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     }
   }
 
-  if (!sections.length && !(errors || []).length) {
+  if (!unifiedSection && !sections.length && !(errors || []).length) {
     return "";
   }
 
@@ -314,7 +321,7 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     `query: ${truncateText(query, 400)}`
   ];
 
-  if ((errors || []).length && !sections.length) {
+  if ((errors || []).length && !unifiedSection && !sections.length) {
     lines.push(`note: recall was unavailable (${errors.join(" | ")})`);
     lines.push("</hydradb-context>");
     return lines.join("\n");
@@ -325,7 +332,10 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     256,
     (maxContextChars || 7000) - lines.join("\n").length - footer.length - 2
   );
-  lines.push(truncateText(sections.join("\n\n"), maxBodyChars));
+  const body = [unifiedSection, sections.length ? truncateText(sections.join("\n\n"), maxBodyChars) : ""]
+    .filter(Boolean)
+    .join("\n\n");
+  lines.push(body);
   lines.push(footer);
   return lines.join("\n");
 }

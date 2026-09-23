@@ -27,6 +27,15 @@ function trimText(value, maxLength = 1200) {
   return `${normalized.slice(0, maxLength - 3)}...`;
 }
 
+// PRO-1618: a unified query response is shown and injected whole (no
+// compaction of llm_prompt, chunk content, enrichment, temporal facts or graph
+// paths), so its normaliser trims surrounding whitespace only. It takes the
+// same (value, maxLength) arguments as trimText and ignores the length, which
+// lets the node/relation/triplet sanitisers below serve both layouts.
+function wholeText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function extractChunkText(chunk) {
   if (!chunk || typeof chunk !== "object") {
     return "";
@@ -120,9 +129,11 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
-function sanitizeNode(node) {
+// `trim` is trimText (the split layout's length caps) unless the caller is the
+// unified normaliser, which passes wholeText.
+function sanitizeNode(node, trim = trimText) {
   if (typeof node === "string") {
-    return { name: trimText(redactSecrets(node), 120) };
+    return { name: trim(redactSecrets(node), 120) };
   }
 
   if (!node || typeof node !== "object") {
@@ -130,13 +141,13 @@ function sanitizeNode(node) {
   }
 
   return {
-    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120)
+    name: trim(redactSecrets(node.name || node.label || node.id || ""), 120)
   };
 }
 
-function sanitizeRelation(relation) {
+function sanitizeRelation(relation, trim = trimText) {
   if (typeof relation === "string") {
-    return { canonical_predicate: trimText(redactSecrets(relation), 80) };
+    return { canonical_predicate: trim(redactSecrets(relation), 80) };
   }
 
   if (!relation || typeof relation !== "object") {
@@ -144,29 +155,29 @@ function sanitizeRelation(relation) {
   }
 
   return {
-    canonical_predicate: trimText(
+    canonical_predicate: trim(
       redactSecrets(
         relation.canonical_predicate || relation.predicate || relation.label || relation.type || ""
       ),
       80
     ),
-    context: trimText(redactSecrets(relation.context || relation.description || ""), 180),
-    temporal_details: trimText(
+    context: trim(redactSecrets(relation.context || relation.description || ""), 180),
+    temporal_details: trim(
       redactSecrets(relation.temporal_details || relation.time || ""),
       80
     )
   };
 }
 
-function sanitizeTriplet(triplet) {
+function sanitizeTriplet(triplet, trim = trimText) {
   if (!triplet || typeof triplet !== "object") {
     return null;
   }
 
   return {
-    source: sanitizeNode(triplet.source),
-    relation: sanitizeRelation(triplet.relation),
-    target: sanitizeNode(triplet.target)
+    source: sanitizeNode(triplet.source, trim),
+    relation: sanitizeRelation(triplet.relation, trim),
+    target: sanitizeNode(triplet.target, trim)
   };
 }
 
@@ -351,21 +362,20 @@ function normalizeUnifiedChunk(chunk) {
     return null;
   }
   const normalized = {
-    contextId: trimText(redactSecrets(chunk.context_id == null ? "" : String(chunk.context_id)), 200),
-    chunkId: trimText(redactSecrets(chunk.chunk_id == null ? "" : String(chunk.chunk_id)), 120),
+    contextId: wholeText(redactSecrets(chunk.context_id == null ? "" : String(chunk.context_id))),
+    chunkId: wholeText(redactSecrets(chunk.chunk_id == null ? "" : String(chunk.chunk_id))),
     score: typeof chunk.score === "number" ? chunk.score : undefined,
-    content: trimText(redactSecrets(typeof chunk.content === "string" ? chunk.content : ""))
+    content: wholeText(redactSecrets(typeof chunk.content === "string" ? chunk.content : ""))
   };
   // enrichment is a plain string (CONTRACT), omitted when empty; its declared
   // context_category rides beside it as enrichment_kind, which can be present
-  // with no enrichment at all. Each is kept only when it holds text.
-  const enrichment = trimText(redactSecrets(typeof chunk.enrichment === "string" ? chunk.enrichment : ""));
+  // with no enrichment at all. Each is kept only when it holds text, and whole.
+  const enrichment = wholeText(redactSecrets(typeof chunk.enrichment === "string" ? chunk.enrichment : ""));
   if (enrichment) {
     normalized.enrichment = enrichment;
   }
-  const enrichmentKind = trimText(
-    redactSecrets(typeof chunk.enrichment_kind === "string" ? chunk.enrichment_kind : ""),
-    80
+  const enrichmentKind = wholeText(
+    redactSecrets(typeof chunk.enrichment_kind === "string" ? chunk.enrichment_kind : "")
   );
   if (enrichmentKind) {
     normalized.enrichmentKind = enrichmentKind;
@@ -374,7 +384,7 @@ function normalizeUnifiedChunk(chunk) {
     normalized.temporal = chunk.temporal
       .filter((fact) => fact && typeof fact === "object")
       .map((fact) => ({
-        content: trimText(redactSecrets(typeof fact.content === "string" ? fact.content : ""), 400),
+        content: wholeText(redactSecrets(typeof fact.content === "string" ? fact.content : "")),
         startDate: fact.start_date ?? null,
         endDate: fact.end_date ?? null
       }));
@@ -392,8 +402,9 @@ function normalizeUnifiedChunk(chunk) {
 // graph[] is one flat list of paths with a path_summary each and an
 // origin ("query_path" or "chunk_relation"); forceful_relations[] are the
 // chunks pulled in by a forceful relation declared at ingest; llm_prompt is
-// the server-built string to inject, kept whole apart from the secret
-// redaction every injected text gets.
+// the server-built string to inject. Nothing here is compacted: llm_prompt
+// and every text field are kept whole apart from the secret redaction every
+// injected text gets (and surrounding whitespace on the fields).
 export function normalizeUnifiedResponse(response) {
   const chunks = (Array.isArray(response?.chunks) ? response.chunks : [])
     .map((chunk) => normalizeUnifiedChunk(chunk))
@@ -405,11 +416,10 @@ export function normalizeUnifiedResponse(response) {
         return null;
       }
       const triplets = Array.isArray(entry.triplets)
-        ? entry.triplets.map((triplet) => sanitizeTriplet(triplet)).filter(Boolean)
+        ? entry.triplets.map((triplet) => sanitizeTriplet(triplet, wholeText)).filter(Boolean)
         : [];
-      const pathSummary = trimText(
-        redactSecrets(typeof entry.path_summary === "string" ? entry.path_summary : ""),
-        400
+      const pathSummary = wholeText(
+        redactSecrets(typeof entry.path_summary === "string" ? entry.path_summary : "")
       );
       if (!triplets.length && !pathSummary) {
         return null;
@@ -427,8 +437,8 @@ export function normalizeUnifiedResponse(response) {
       }
       return {
         via: {
-          from: trimText(redactSecrets(entry?.via?.from == null ? "" : String(entry.via.from)), 200),
-          to: trimText(redactSecrets(entry?.via?.to == null ? "" : String(entry.via.to)), 200)
+          from: wholeText(redactSecrets(entry?.via?.from == null ? "" : String(entry.via.from))),
+          to: wholeText(redactSecrets(entry?.via?.to == null ? "" : String(entry.via.to)))
         },
         chunk
       };

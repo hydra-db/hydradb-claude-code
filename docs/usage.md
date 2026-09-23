@@ -229,7 +229,7 @@ On each user prompt, the plugin can inject a bounded `<hydradb-context>` block c
 - chunk-level graph relations
 - extra linked context when HydraDB returns it
 
-On a unified database the block is instead the server-built `llm_prompt` from the four-key query response, injected verbatim (secret redaction and the `maxContextChars` budget still apply). It is markdown and already carries the results (`## Results`, each with its `**Enrichment:**` and `**Category:**`), forceful relations (`## Forceful relations`) and graph paths (`## Related facts`), numbered for citation as `[1]`, `[R1]`, `[P1]`, so nothing is rebuilt from the chunks.
+On a unified database the block is instead the server-built `llm_prompt` from the four-key query response, injected whole and verbatim: secret redaction still applies, but it is never truncated or summarised, and the `maxContextChars` budget applies to split databases only. Claude Code itself caps a hook's `additionalContext` at 10,000 characters; a longer block is saved by Claude Code to a file in the session directory and replaced with the file path and a preview of its first 2,000 characters, so a very large `llm_prompt` reaches Claude through that file rather than inline. It is markdown and already carries the results (`## Results`, each with its `**Enrichment:**` and `**Category:**`), forceful relations (`## Forceful relations`) and graph paths (`## Related facts`), numbered for citation as `[1]`, `[R1]`, `[P1]`, so nothing is rebuilt from the chunks.
 
 This content is explicitly framed as reference material, not as new instructions.
 

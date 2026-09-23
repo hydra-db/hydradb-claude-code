@@ -565,6 +565,117 @@ export async function runHttpTests() {
     assert.ok(structured.includes("- [P2] **Refund policy** -allows refunds within→ **30 days** (chunk relation)"));
   }
 
+  // 10d-2) No compaction on the unified query path: llm_prompt is injected
+  //        whole however far it runs past maxContextChars, and the chunk
+  //        content, enrichment, temporal facts, graph path summaries and
+  //        triplets come through the normaliser and the structured rendering
+  //        uncut. Secret redaction is not compaction and still applies.
+  {
+    const long = (label, size) => `${label} ${"x".repeat(size)} END-OF-${label}`;
+    const secret = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";
+    const bigPrompt = `# Query results\n\n${long("PROMPT", 20000)}\nkey ${secret}`;
+    const content = long("CONTENT", 5000);
+    const enrichment = long("ENRICHMENT", 3000);
+    const temporal = long("TEMPORAL", 2000);
+    const summary = long("SUMMARY", 2000);
+    const context = long("RELCONTEXT", 1000);
+    const entity = long("ENTITY", 500);
+    const contextId = long("CTXID", 400);
+    const response = {
+      ...UNIFIED_QUERY_RESPONSE,
+      chunks: [
+        {
+          ...UNIFIED_QUERY_RESPONSE.chunks[0],
+          context_id: contextId,
+          content,
+          enrichment,
+          temporal: [{ content: temporal, start_date: "2026-01-01", end_date: null }]
+        }
+      ],
+      graph: [
+        {
+          origin: "query_path",
+          triplets: [
+            {
+              source: { name: entity },
+              relation: { predicate: "relates to", context, temporal_details: temporal },
+              target: { name: "B" }
+            }
+          ],
+          path_summary: summary
+        }
+      ],
+      forceful_relations: [
+        {
+          via: { from: contextId, to: "t" },
+          chunk: { context_id: "r1", content, enrichment }
+        }
+      ],
+      llm_prompt: bigPrompt
+    };
+    const unified = normalizeRetrievalResponse(response);
+    assert.equal(unified.llmPrompt, bigPrompt.replace(secret, "[REDACTED:anthropic]"), "llm_prompt is whole, only redacted");
+    assert.equal(unified.chunks[0].contextId, contextId);
+    assert.equal(unified.chunks[0].content, content, "chunk content is not truncated");
+    assert.equal(unified.chunks[0].enrichment, enrichment, "enrichment is not truncated");
+    assert.equal(unified.chunks[0].temporal[0].content, temporal, "temporal facts are not truncated");
+    assert.equal(unified.graph[0].pathSummary, summary, "path summaries are not truncated");
+    assert.equal(unified.graph[0].triplets[0].source.name, entity);
+    assert.equal(unified.graph[0].triplets[0].relation.context, context);
+    assert.equal(unified.graph[0].triplets[0].relation.temporal_details, temporal);
+    assert.equal(unified.forcefulRelations[0].via.from, contextId);
+    assert.equal(unified.forcefulRelations[0].chunk.content, content);
+
+    const empty = { chunks: [], queryPaths: [], graphContext: {}, additionalContext: {} };
+    const block = buildHydraContextBlock({
+      query: "q",
+      unified,
+      memory: empty,
+      knowledge: empty,
+      errors: [],
+      maxContextChars: 7000
+    });
+    assert.ok(block.length > 20000, "maxContextChars does not cap a unified block");
+    assert.ok(block.includes(`\n${unified.llmPrompt}\n</hydradb-context>`), "the whole llm_prompt is injected");
+    assert.ok(block.includes("END-OF-PROMPT"));
+    assert.ok(!block.includes(secret), "secret redaction still applies");
+
+    // With no llm_prompt the structured fallback is injected, whole too.
+    const fallback = buildHydraContextBlock({
+      query: "q",
+      unified: { ...unified, llmPrompt: "" },
+      memory: empty,
+      knowledge: empty,
+      errors: [],
+      maxContextChars: 7000
+    });
+    for (const text of [content, enrichment, temporal, summary]) {
+      assert.ok(fallback.includes(text), "the structured fallback is not truncated");
+    }
+
+    const structured = buildUnifiedStructuredString(unified);
+    assert.ok(structured.includes(`\n${content}\n`), "structured content is whole");
+    assert.ok(structured.includes(`**Enrichment:** ${enrichment}\n`), "structured enrichment is whole");
+    assert.ok(structured.includes(`**Temporal:** ${temporal}\n`), "structured temporal is whole");
+    assert.ok(structured.includes(`  ${summary}`), "structured path summary is whole");
+    assert.ok(!structured.includes("..."), "nothing in the structured form is elided");
+
+    // The split lane keeps its budget: the same size of text is still capped.
+    const split = normalizeRetrievalResponse({
+      ...SPLIT_QUERY_RESPONSE,
+      chunks: [{ ...SPLIT_QUERY_RESPONSE.chunks[0], chunk_content: long("SPLIT", 20000) }]
+    });
+    assert.ok(split.chunks[0].text.length <= 1200, "split chunk text keeps its normaliser cap");
+    const splitBlock = buildHydraContextBlock({
+      query: "q",
+      memory: split,
+      knowledge: empty,
+      errors: [],
+      maxContextChars: 1000
+    });
+    assert.ok(splitBlock.length <= 1000, "maxContextChars still caps a split block");
+  }
+
   // 10e) The real envelope the server's own handler test renders (PRO-1618
   //      final shape): enrichment is a string, enrichment_kind sits beside it
   //      on chunks[] and forceful_relations[].chunk, and llm_prompt is the

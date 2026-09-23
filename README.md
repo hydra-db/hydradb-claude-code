@@ -103,7 +103,7 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `recallMode` | `thinking` | Recall strategy passed to HydraDB |
 | `graphContext` | `true` | Include graph entity paths and relations in recall |
 | `followForcefulRelations` | `true` | Unified databases only: follow the forceful relations declared at ingest, so recall returns the linked context (`forceful_relations[]`, the `### R1.` entries of `llm_prompt`) |
-| `maxContextChars` | `7000` | Max characters injected into Claude's context per prompt |
+| `maxContextChars` | `7000` | Max characters injected into Claude's context per prompt on a split database (a unified database's `llm_prompt` is injected whole) |
 | `maxMemoryResults` | `6` | Max memory chunks returned per recall |
 | `maxKnowledgeResults` | `4` | Max knowledge chunks returned per recall |
 | `requestTimeoutMs` | `15000` | Timeout for HydraDB read requests |
