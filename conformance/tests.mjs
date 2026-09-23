@@ -842,6 +842,21 @@ export async function runHttpTests() {
     ]);
     assert.equal(parsed.success, false);
     assert.equal(parsed.message, "1 of 2 queued");
+
+    // Server-provided 202 text is untrusted: it is printed and returned as
+    // JSON, so terminal control sequences are stripped and secrets redacted.
+    const hostile = parseUnifiedIngestResponse({
+      message: "done\u001b]0;pwned\u0007",
+      results: [
+        { source_id: "ok\u001b[2J\u001b[31m-1", status: "queued" },
+        { source_id: "bad-2", status: "failed", error: "token=abcdefghijklmnop\r\u001b[1Afake ok", error_code: "E\u0007" }
+      ]
+    });
+    assert.deepEqual(hostile.contextIds, ["ok-1"], "context ids carry no escape sequences");
+    assert.equal(hostile.message, "done");
+    assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(hostile.failed[0].error), "no control characters in the reason");
+    assert.ok(!hostile.failed[0].error.includes("abcdefghijklmnop"), "a secret-shaped reason is redacted");
+    assert.equal(hostile.failed[0].errorCode, "E");
   }
 
   // 12c) A 202 that refuses an item is a FAILED write, not a return value.

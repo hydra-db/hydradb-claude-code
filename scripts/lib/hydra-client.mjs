@@ -1,5 +1,5 @@
 import { createHydraWrapper } from "./hydra/index.mjs";
-import { redactSecrets, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
+import { redactSecrets, stripControlChars, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -690,16 +690,24 @@ function parseMaybeJson(value) {
 // id (the caller's context_id, or the one the server generated) and `infer`
 // echoes enrich. Normalised to the plugin's names so no reader downstream
 // depends on the wire spelling; the raw data stays attached.
+// Every string in the 202 is server-provided and some of it is printed (the
+// context id after `ingest --note`, refusal reasons in the raised error) or
+// returned as JSON, so each is redacted, stripped of terminal control
+// sequences and bounded.
+function ingestResponseText(value, maxLength) {
+  return trimText(stripControlChars(redactSecrets(String(value))), maxLength);
+}
+
 export function parseUnifiedIngestResponse(data) {
   const results = (Array.isArray(data?.results) ? data.results : [])
     .filter((entry) => entry && typeof entry === "object")
     .map((entry) => ({
-      contextId: entry.source_id == null ? "" : String(entry.source_id),
-      title: entry.title ?? null,
-      status: entry.status == null ? "" : String(entry.status),
+      contextId: entry.source_id == null ? "" : ingestResponseText(entry.source_id, 200),
+      title: entry.title == null ? null : ingestResponseText(entry.title, 200),
+      status: entry.status == null ? "" : ingestResponseText(entry.status, 40),
       enrich: Boolean(entry.infer),
-      error: entry.error ?? null,
-      errorCode: entry.error_code ?? null
+      error: entry.error == null ? null : ingestResponseText(entry.error, 400),
+      errorCode: entry.error_code == null ? null : ingestResponseText(entry.error_code, 80)
     }));
   const queued = results.filter((entry) => entry.status === "queued");
   const failed = results.filter((entry) => entry.status === "failed");
@@ -707,7 +715,7 @@ export function parseUnifiedIngestResponse(data) {
     value != null && Number.isFinite(Number(value)) ? Number(value) : fallback;
   return {
     success: data?.success !== false,
-    message: typeof data?.message === "string" ? data.message : "",
+    message: typeof data?.message === "string" ? ingestResponseText(data.message, 400) : "",
     successCount: count(data?.success_count, queued.length),
     failedCount: count(data?.failed_count, failed.length),
     contextIds: queued.map((entry) => entry.contextId).filter(Boolean),
