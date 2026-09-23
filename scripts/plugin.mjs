@@ -7,10 +7,11 @@ import path from "node:path";
 import process from "node:process";
 
 import { formatStatus, loadConfig, PROJECT_CONFIG_FILES } from "./lib/config.mjs";
-import { buildHydraContextBlock } from "./lib/context-format.mjs";
+import { buildHydraContextBlock, buildUnifiedStructuredString } from "./lib/context-format.mjs";
 import {
   combineRecallErrors,
   DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
+  EMPTY_UNIFIED_RECALL,
   HydraClient
 } from "./lib/hydra-client.mjs";
 import { redactSecrets, wasRedacted } from "./lib/sanitize.mjs";
@@ -243,13 +244,14 @@ async function performRecall(client, config, query) {
       client.recallUnified(query, {
         maxResults: config.maxMemoryResults + config.maxKnowledgeResults,
         mode: config.recallMode,
-        graphContext: config.graphContext
+        graphContext: config.graphContext,
+        followForcefulRelations: config.followForcefulRelations
       })
     ]);
     const unified = settled[0];
     return {
       searchMode,
-      unified: unified.status === "fulfilled" ? unified.value : EMPTY_RECALL,
+      unified: unified.status === "fulfilled" ? unified.value : EMPTY_UNIFIED_RECALL,
       memory: EMPTY_RECALL,
       knowledge: EMPTY_RECALL,
       errors: combineRecallErrors([unified])
@@ -279,6 +281,23 @@ async function performRecall(client, config, query) {
   }
 
   const settled = await Promise.allSettled(tasks);
+
+  // The layout probe can fail and read as split; the server then refuses the
+  // split kind and the client retries once as unified, so a split-mode call
+  // can legitimately come back with the four-key body. It is reported as the
+  // unified result it is, not pushed through the MEMORY/KNOWLEDGE template.
+  const answeredUnified = settled.find(
+    (entry) => entry.status === "fulfilled" && entry.value?.layout === "unified"
+  );
+  if (answeredUnified) {
+    return {
+      searchMode: "unified",
+      unified: answeredUnified.value,
+      memory: EMPTY_RECALL,
+      knowledge: EMPTY_RECALL,
+      errors: combineRecallErrors(settled)
+    };
+  }
   let nextIndex = 0;
 
   const memory =
@@ -495,6 +514,16 @@ async function handleUserPromptSubmit() {
       recall.memory.graphContext?.queryPathsDetailed?.length || recall.memory.queryPaths.length,
     knowledgeGraphPathCount:
       recall.knowledge.graphContext?.queryPathsDetailed?.length || recall.knowledge.queryPaths.length,
+    // PRO-1618: a unified recall is one list plus graph paths and forceful
+    // relations. The keys exist only when the recall was unified, so the split
+    // payload keeps its exact shape.
+    ...(recall.searchMode === "unified"
+      ? {
+          unifiedCount: recall.unified.chunks.length,
+          unifiedGraphPathCount: recall.unified.graph.length,
+          unifiedForcefulRelationCount: recall.unified.forcefulRelations.length
+        }
+      : {}),
     errors: recall.errors,
     additionalContext,
     updatedAt: now
@@ -502,6 +531,9 @@ async function handleUserPromptSubmit() {
   if (configResult.config.debug) {
     state.lastRecall.memory = recall.memory;
     state.lastRecall.knowledge = recall.knowledge;
+    if (recall.searchMode === "unified") {
+      state.lastRecall.unified = recall.unified;
+    }
   }
   await writeState(dataDir, state);
   await appendDebugLog(dataDir, configResult.config.debug, "user-prompt-submit", {
@@ -510,6 +542,7 @@ async function handleUserPromptSubmit() {
     emitted: Boolean(additionalContext),
     memoryCount: recall.memory.chunks.length,
     knowledgeCount: recall.knowledge.chunks.length,
+    ...(recall.searchMode === "unified" ? { unifiedCount: recall.unified.chunks.length } : {}),
     errorCount: recall.errors.length
   });
 
@@ -651,6 +684,7 @@ function formatStatusText(summary) {
     `ingestionMode: ${summary.resolvedConfig.ingestionMode}`,
     `recallMode: ${summary.resolvedConfig.recallMode}`,
     `graphContext: ${summary.resolvedConfig.graphContext}`,
+    `followForcefulRelations: ${summary.resolvedConfig.followForcefulRelations}`,
     `maxContextChars: ${summary.resolvedConfig.maxContextChars}`,
     `requestTimeoutMs: ${summary.resolvedConfig.requestTimeoutMs}`,
     `writeTimeoutMs: ${summary.resolvedConfig.writeTimeoutMs}`,
@@ -687,6 +721,11 @@ function formatLastRecallText(lastRecall) {
   }
 
   lines.push(`emitted: ${Boolean(lastRecall.emitted)}`);
+  if (lastRecall.unifiedCount != null) {
+    lines.push(`unifiedCount: ${lastRecall.unifiedCount}`);
+    lines.push(`unifiedGraphPathCount: ${lastRecall.unifiedGraphPathCount ?? 0}`);
+    lines.push(`unifiedForcefulRelationCount: ${lastRecall.unifiedForcefulRelationCount ?? 0}`);
+  }
   lines.push(`memoryCount: ${lastRecall.memoryCount ?? 0}`);
   lines.push(`knowledgeCount: ${lastRecall.knowledgeCount ?? 0}`);
   lines.push(
@@ -732,7 +771,7 @@ async function handleRemember(args) {
     throw new Error("remember content was empty after redaction");
   }
 
-  await runtime.client.addTextMemory(sanitizedText, {
+  const stored = await runtime.client.addTextMemory(sanitizedText, {
     infer: true,
     isMarkdown: /[#*_`>-]/.test(sanitizedText),
     title: "Claude Code manual memory",
@@ -743,10 +782,15 @@ async function handleRemember(args) {
     sourceId: `manual-memory:${Date.now()}`
   });
 
+  // A unified ingest answers with the queued context ids (results[].source_id
+  // on the 202); the split path has nothing comparable to show.
+  const contextId = Array.isArray(stored?.contextIds) ? stored.contextIds[0] : "";
   process.stdout.write(
-    wasRedacted(text, sanitizedText)
-      ? "Stored memory in HydraDB after redacting sensitive tokens.\n"
-      : "Stored memory in HydraDB.\n"
+    `${
+      wasRedacted(text, sanitizedText)
+        ? "Stored memory in HydraDB after redacting sensitive tokens."
+        : "Stored memory in HydraDB."
+    }${contextId ? ` context_id: ${contextId}` : ""}\n`
   );
 }
 
@@ -774,7 +818,7 @@ async function handleSaveSession(args) {
     runtime.configResult.workspaceName
   );
 
-  await runtime.client.addTextMemory(transcript, {
+  const stored = await runtime.client.addTextMemory(transcript, {
     infer: true,
     isMarkdown: true,
     title: `Claude Code session ${sessionId}`,
@@ -788,7 +832,9 @@ async function handleSaveSession(args) {
   const payload = {
     sessionId,
     turnCount: turns.length,
-    sourceId: sessionMemorySourceId(sessionId)
+    sourceId: sessionMemorySourceId(sessionId),
+    // Present only for a unified database: the context ids the 202 queued.
+    ...(Array.isArray(stored?.contextIds) ? { contextIds: stored.contextIds } : {})
   };
 
   if (jsonMode) {
@@ -805,14 +851,11 @@ function renderRecallText(result) {
   const lines = [];
 
   if (result.searchMode === "unified") {
-    lines.push("Context:");
-    if (result.unified?.chunks?.length) {
-      for (const chunk of result.unified.chunks) {
-        lines.push(`- ${chunk.title || "Item"}: ${chunk.text}`);
-      }
-    } else {
-      lines.push("- none");
-    }
+    // The structured view of the four-key body: chunks with their
+    // context_id/score/content/enrichment, forceful relations, graph path
+    // summaries. The --json payload carries llmPrompt for the model.
+    const structured = buildUnifiedStructuredString(result.unified);
+    lines.push(structured || "Context:\n- none");
   }
 
   if (result.searchMode === "memory" || result.searchMode === "both") {

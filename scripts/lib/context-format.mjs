@@ -1,7 +1,13 @@
-import { truncateText, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
+import { normalizeText, truncateText, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 function safeString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+// PRO-1618: unified query text is never compacted. Line endings are
+// normalised and surrounding whitespace trimmed, nothing is cut.
+function wholeText(text) {
+  return normalizeText(text).trim();
 }
 
 function formatTriplet(triplet) {
@@ -150,17 +156,142 @@ export function buildContextString(label, result) {
   return lines.join("\n").trim();
 }
 
+// One unified result as the server's markdown llm_prompt lays it out: a
+// `### n.` heading, a meta line (relevance or where it was linked from, and
+// the declared category), the content, its enrichment, and every temporal
+// fact the query engaged (CONTRACT: chunks[].temporal is present only then,
+// and it is the dated version of the claim, so leaving it out would drop the
+// one thing that says when the content held). Chunks carry no source title,
+// so the heading names the context_id. Content, enrichment and temporal facts
+// are rendered whole, never truncated or summarised.
+function pushUnifiedChunkLines(lines, chunk, label, linkedFrom) {
+  lines.push(`### ${label}. ${chunk?.contextId || "(unknown)"}`);
+  const meta = [];
+  if (linkedFrom) {
+    meta.push(`**Linked from:** ${linkedFrom}`);
+  } else if (typeof chunk?.score === "number") {
+    meta.push(`**Relevance:** ${chunk.score.toFixed(2)}`);
+  }
+  if (chunk?.enrichmentKind) {
+    meta.push(`**Category:** ${chunk.enrichmentKind}`);
+  }
+  if (meta.length) {
+    lines.push(`- ${meta.join(" · ")}`);
+  }
+  if (chunk?.content) {
+    lines.push("", wholeText(chunk.content));
+  }
+  if (chunk?.enrichment) {
+    lines.push("", `**Enrichment:** ${wholeText(chunk.enrichment)}`);
+  }
+  const temporal = (Array.isArray(chunk?.temporal) ? chunk.temporal : []).filter((fact) => fact?.content);
+  if (temporal.length) {
+    lines.push("");
+    for (const fact of temporal) {
+      lines.push(`**Temporal:** ${wholeText(fact.content)}`);
+    }
+  }
+  lines.push("");
+}
+
+// One graph path as a `## Related facts` line: its triplets as
+// `**A** -predicate→ **B**`, the origin in words, then the path summary.
+function formatUnifiedPath(path, index) {
+  const triplets = Array.isArray(path?.triplets) ? path.triplets : [];
+  const chain = triplets
+    .map((triplet) => {
+      const source = safeString(triplet?.source?.name);
+      const predicate = safeString(triplet?.relation?.canonical_predicate || triplet?.relation?.predicate);
+      const target = safeString(triplet?.target?.name);
+      if (!source && !predicate && !target) {
+        return "";
+      }
+      return `**${source || "source"}** -${predicate || "related to"}→ **${target || "target"}**`;
+    })
+    .filter(Boolean)
+    .join("; ");
+  const origin = path?.origin ? ` (${path.origin.replace("_", " ")})` : "";
+  const lines = [];
+  if (chain) {
+    lines.push(`- [P${index + 1}] ${chain}${origin}`);
+    if (path.pathSummary) {
+      lines.push(`  ${path.pathSummary}`);
+    }
+  } else if (path?.pathSummary) {
+    lines.push(`- [P${index + 1}] ${path.pathSummary}${origin}`);
+  }
+  return lines;
+}
+
+// The forceful-relations section as the server's llm_prompt spells it: these
+// chunks were linked by the author at ingest, not ranked for the query, and
+// the guide line says so to whoever reads the section.
+export const UNIFIED_FORCEFUL_RELATIONS_HEADING = "## Forceful relations";
+export const UNIFIED_FORCEFUL_RELATIONS_GUIDE =
+  "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.";
+
+// A unified recall rendered from its structured fields (CONTRACT: chunks[]
+// context_id/score/content/enrichment/enrichment_kind/temporal,
+// forceful_relations[], graph[] path_summary), in the markdown layout and the
+// n / Rn / [Pn] labelling the server's llm_prompt uses (`## Results`,
+// `## Forceful relations`, `## Related facts`). This is the human-readable
+// form for `query` text output, and the fallback for the injected block only
+// when a server sent no llm_prompt.
+export function buildUnifiedStructuredString(result) {
+  const lines = [];
+
+  const chunks = Array.isArray(result?.chunks) ? result.chunks : [];
+  if (chunks.length) {
+    lines.push("## Results", "");
+    chunks.forEach((chunk, index) => {
+      pushUnifiedChunkLines(lines, chunk, String(index + 1));
+    });
+  }
+
+  const forcefulRelations = Array.isArray(result?.forcefulRelations) ? result.forcefulRelations : [];
+  if (forcefulRelations.length) {
+    lines.push(UNIFIED_FORCEFUL_RELATIONS_HEADING, "", UNIFIED_FORCEFUL_RELATIONS_GUIDE, "");
+    forcefulRelations.forEach((entry, index) => {
+      pushUnifiedChunkLines(lines, entry.chunk, `R${index + 1}`, entry.via?.from || "");
+    });
+  }
+
+  const graph = Array.isArray(result?.graph) ? result.graph : [];
+  const facts = graph.flatMap((path, index) => formatUnifiedPath(path, index));
+  if (facts.length) {
+    lines.push("## Related facts", "", ...facts);
+  }
+
+  return lines.join("\n").trim();
+}
+
+// What the model sees for a unified recall: the server-built llm_prompt, as it
+// came. It is markdown and numbers what the model is told to cite (results
+// `### 1.`, forceful relations `### R1.`, related facts `[P1]`, cited in
+// brackets as [1] / [R1] / [P1]), so it is never re-formatted here and never
+// compacted: the only touch is the secret redaction applied at normalisation.
+// The maxContextChars budget does not apply to it (see buildHydraContextBlock).
+// The structured rendering is used only if a server sent no prompt at all, so
+// a result is never silently dropped.
+export function buildUnifiedContextString(result) {
+  if (!result || typeof result !== "object") {
+    return "";
+  }
+  const llmPrompt = typeof result.llmPrompt === "string" ? result.llmPrompt : "";
+  if (llmPrompt.trim()) {
+    return llmPrompt;
+  }
+  return buildUnifiedStructuredString(result);
+}
+
 export function buildHydraContextBlock({ query, unified, memory, knowledge, errors, maxContextChars }) {
   const sections = [];
 
-  // PRO-1618: a unified database answers with one ranked list, rendered as a
-  // single CONTEXT section rather than a MEMORY/KNOWLEDGE split.
-  if (unified?.chunks?.length || unified?.queryPaths?.length || unified?.graphContext?.queryPathsDetailed?.length) {
-    const section = buildSection("CONTEXT", unified);
-    if (section) {
-      sections.push(section);
-    }
-  }
+  // PRO-1618: a unified database answers with the four-key body; the section
+  // is its llm_prompt, verbatim, in place of the MEMORY/KNOWLEDGE split. It is
+  // injected whole: the maxContextChars budget below applies to the split
+  // MEMORY/KNOWLEDGE sections only.
+  const unifiedSection = wholeText(buildUnifiedContextString(unified));
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {
     const section = buildContextString("MEMORY", memory);
@@ -180,7 +311,7 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     }
   }
 
-  if (!sections.length && !(errors || []).length) {
+  if (!unifiedSection && !sections.length && !(errors || []).length) {
     return "";
   }
 
@@ -190,7 +321,7 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     `query: ${truncateText(query, 400)}`
   ];
 
-  if ((errors || []).length && !sections.length) {
+  if ((errors || []).length && !unifiedSection && !sections.length) {
     lines.push(`note: recall was unavailable (${errors.join(" | ")})`);
     lines.push("</hydradb-context>");
     return lines.join("\n");
@@ -201,7 +332,10 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     256,
     (maxContextChars || 7000) - lines.join("\n").length - footer.length - 2
   );
-  lines.push(truncateText(sections.join("\n\n"), maxBodyChars));
+  const body = [unifiedSection, sections.length ? truncateText(sections.join("\n\n"), maxBodyChars) : ""]
+    .filter(Boolean)
+    .join("\n\n");
+  lines.push(body);
   lines.push(footer);
   return lines.join("\n");
 }

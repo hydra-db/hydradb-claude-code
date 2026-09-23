@@ -107,7 +107,8 @@ assert.equal(plainRecall.chunks[0].text, '{"content": not json');
 
 // PRO-1618: the unified item mapping. A unified database refuses the split-era
 // `memories`/`app_knowledge` fields, so every write the plugin makes has to
-// survive translation into items[] with nothing dropped.
+// survive translation into the contract's `context[]` items with nothing
+// dropped and nothing sent under a pre-contract name.
 assert.deepEqual(
   memoryToItem({
     user_assistant_pairs: [{ user: "I prefer dark mode", assistant: "Noted" }],
@@ -124,7 +125,7 @@ assert.deepEqual(
     ],
     context_id: "claude-turn:1",
     enrich: true,
-    custom_instructions: "focus",
+    instructions: "focus",
     attributes: { topic: "ui" }
   }
 );

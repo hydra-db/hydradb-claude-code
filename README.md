@@ -98,11 +98,12 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `autoRecall` | `true` | Automatically recall HydraDB context on each user prompt |
 | `autoIngest` | `true` | Automatically sync workspace docs on session start |
 | `captureMode` | `session-upsert` | `turn`, `session-upsert`, `both`, or `off` |
-| `searchMode` | `memory` | `memory`, `knowledge`, `both`, `unified`, or `auto`. On a database created with `type: "unified"` the plugin detects the layout and always recalls one ranked list (see `hydradb-api-info/unified-databases.md`) |
+| `searchMode` | `memory` | `memory`, `knowledge`, `both`, `unified`, or `auto`. On a database created with `type: "unified"` the plugin detects the layout, sends no `type`, and injects the server-built `llm_prompt` from the four-key query response (see `hydradb-api-info/unified-databases.md`) |
 | `ingestionMode` | `memory` | `memory`, `knowledge`, or `auto` |
 | `recallMode` | `thinking` | Recall strategy passed to HydraDB |
 | `graphContext` | `true` | Include graph entity paths and relations in recall |
-| `maxContextChars` | `7000` | Max characters injected into Claude's context per prompt |
+| `followForcefulRelations` | `true` | Unified databases only: follow the forceful relations declared at ingest, so recall returns the linked context (`forceful_relations[]`, the `### R1.` entries of `llm_prompt`) |
+| `maxContextChars` | `7000` | Max characters injected into Claude's context per prompt on a split database (a unified database's `llm_prompt` is injected whole) |
 | `maxMemoryResults` | `6` | Max memory chunks returned per recall |
 | `maxKnowledgeResults` | `4` | Max knowledge chunks returned per recall |
 | `requestTimeoutMs` | `15000` | Timeout for HydraDB read requests |
@@ -127,6 +128,7 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `HYDRADB_USER_NAME` | `userName` |
 | `HYDRADB_REQUEST_TIMEOUT_MS` | `requestTimeoutMs` |
 | `HYDRADB_WRITE_TIMEOUT_MS` | `writeTimeoutMs` |
+| `HYDRADB_FOLLOW_FORCEFUL_RELATIONS` | `followForcefulRelations` |
 | `HYDRADB_DEBUG` | `debug` |
 
 ## Usage

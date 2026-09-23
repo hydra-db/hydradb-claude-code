@@ -1,5 +1,5 @@
 import { createHydraWrapper } from "./hydra/index.mjs";
-import { redactSecrets, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
+import { redactSecrets, stripControlChars, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -25,6 +25,15 @@ function trimText(value, maxLength = 1200) {
     return normalized;
   }
   return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+// PRO-1618: a unified query response is shown and injected whole (no
+// compaction of llm_prompt, chunk content, enrichment, temporal facts or graph
+// paths), so its normaliser trims surrounding whitespace only. It takes the
+// same (value, maxLength) arguments as trimText and ignores the length, which
+// lets the node/relation/triplet sanitisers below serve both layouts.
+function wholeText(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function extractChunkText(chunk) {
@@ -120,9 +129,11 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
-function sanitizeNode(node) {
+// `trim` is trimText (the split layout's length caps) unless the caller is the
+// unified normaliser, which passes wholeText.
+function sanitizeNode(node, trim = trimText) {
   if (typeof node === "string") {
-    return { name: trimText(redactSecrets(node), 120) };
+    return { name: trim(redactSecrets(node), 120) };
   }
 
   if (!node || typeof node !== "object") {
@@ -130,13 +141,13 @@ function sanitizeNode(node) {
   }
 
   return {
-    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120)
+    name: trim(redactSecrets(node.name || node.label || node.id || ""), 120)
   };
 }
 
-function sanitizeRelation(relation) {
+function sanitizeRelation(relation, trim = trimText) {
   if (typeof relation === "string") {
-    return { canonical_predicate: trimText(redactSecrets(relation), 80) };
+    return { canonical_predicate: trim(redactSecrets(relation), 80) };
   }
 
   if (!relation || typeof relation !== "object") {
@@ -144,29 +155,29 @@ function sanitizeRelation(relation) {
   }
 
   return {
-    canonical_predicate: trimText(
+    canonical_predicate: trim(
       redactSecrets(
         relation.canonical_predicate || relation.predicate || relation.label || relation.type || ""
       ),
       80
     ),
-    context: trimText(redactSecrets(relation.context || relation.description || ""), 180),
-    temporal_details: trimText(
+    context: trim(redactSecrets(relation.context || relation.description || ""), 180),
+    temporal_details: trim(
       redactSecrets(relation.temporal_details || relation.time || ""),
       80
     )
   };
 }
 
-function sanitizeTriplet(triplet) {
+function sanitizeTriplet(triplet, trim = trimText) {
   if (!triplet || typeof triplet !== "object") {
     return null;
   }
 
   return {
-    source: sanitizeNode(triplet.source),
-    relation: sanitizeRelation(triplet.relation),
-    target: sanitizeNode(triplet.target)
+    source: sanitizeNode(triplet.source, trim),
+    relation: sanitizeRelation(triplet.relation, trim),
+    target: sanitizeNode(triplet.target, trim)
   };
 }
 
@@ -315,12 +326,144 @@ function extractDetailedQueryPaths(response) {
   return paths.map((entry) => sanitizePath(entry)).filter(Boolean).slice(0, 4);
 }
 
+// CONTRACT client rule 4: two response shapes stay live and are told apart by
+// SHAPE, never by a flag. A unified database answers with the four-key body
+// (`graph` and `forceful_relations` are arrays and `llm_prompt` a string); a
+// split database, and every stored log, keeps the v2 shape (`graph_context`,
+// `chunk_content`). The root key is `forceful_relations` only: a body that
+// still says `relations` is not the current contract and is not read as one.
+export function isUnifiedQueryResponse(response) {
+  return Boolean(
+    response &&
+      typeof response === "object" &&
+      Array.isArray(response.graph) &&
+      Array.isArray(response.forceful_relations) &&
+      typeof response.llm_prompt === "string"
+  );
+}
+
+// graph[].origin (CONTRACT): where a path came from. "query_path" is grown
+// from the query's entities, "chunk_relation" is the neighbourhood of a
+// returned chunk. Anything else is not a value the contract defines and is
+// left off rather than passed through.
+export const UNIFIED_GRAPH_ORIGINS = Object.freeze(["query_path", "chunk_relation"]);
+
+// The empty unified result, the shape every unified reader can rely on.
+export const EMPTY_UNIFIED_RECALL = Object.freeze({
+  layout: "unified",
+  chunks: [],
+  graph: [],
+  forcefulRelations: [],
+  llmPrompt: ""
+});
+
+function normalizeUnifiedChunk(chunk) {
+  if (!chunk || typeof chunk !== "object") {
+    return null;
+  }
+  const normalized = {
+    contextId: wholeText(redactSecrets(chunk.context_id == null ? "" : String(chunk.context_id))),
+    chunkId: wholeText(redactSecrets(chunk.chunk_id == null ? "" : String(chunk.chunk_id))),
+    score: typeof chunk.score === "number" ? chunk.score : undefined,
+    content: wholeText(redactSecrets(typeof chunk.content === "string" ? chunk.content : ""))
+  };
+  // enrichment is a plain string (CONTRACT), omitted when empty; its declared
+  // context_category rides beside it as enrichment_kind, which can be present
+  // with no enrichment at all. Each is kept only when it holds text, and whole.
+  const enrichment = wholeText(redactSecrets(typeof chunk.enrichment === "string" ? chunk.enrichment : ""));
+  if (enrichment) {
+    normalized.enrichment = enrichment;
+  }
+  const enrichmentKind = wholeText(
+    redactSecrets(typeof chunk.enrichment_kind === "string" ? chunk.enrichment_kind : "")
+  );
+  if (enrichmentKind) {
+    normalized.enrichmentKind = enrichmentKind;
+  }
+  if (Array.isArray(chunk.temporal) && chunk.temporal.length) {
+    normalized.temporal = chunk.temporal
+      .filter((fact) => fact && typeof fact === "object")
+      .map((fact) => ({
+        content: wholeText(redactSecrets(typeof fact.content === "string" ? fact.content : "")),
+        startDate: fact.start_date ?? null,
+        endDate: fact.end_date ?? null
+      }));
+  }
+  if (!normalized.content && !normalized.enrichment) {
+    return null;
+  }
+  return normalized;
+}
+
+// The four-key unified body (CONTRACT: POST /query on a unified database) in
+// the plugin's own names. chunks[] carry context_id/score/content, the
+// enrichment string and its enrichment_kind (enrichmentKind here), and
+// nothing about their source (GET /context/inspect by context_id for that);
+// graph[] is one flat list of paths with a path_summary each and an
+// origin ("query_path" or "chunk_relation"); forceful_relations[] are the
+// chunks pulled in by a forceful relation declared at ingest; llm_prompt is
+// the server-built string to inject. Nothing here is compacted: llm_prompt
+// and every text field are kept whole apart from the secret redaction every
+// injected text gets (and surrounding whitespace on the fields).
+export function normalizeUnifiedResponse(response) {
+  const chunks = (Array.isArray(response?.chunks) ? response.chunks : [])
+    .map((chunk) => normalizeUnifiedChunk(chunk))
+    .filter(Boolean);
+
+  const graph = (Array.isArray(response?.graph) ? response.graph : [])
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+      const triplets = Array.isArray(entry.triplets)
+        ? entry.triplets.map((triplet) => sanitizeTriplet(triplet, wholeText)).filter(Boolean)
+        : [];
+      const pathSummary = wholeText(
+        redactSecrets(typeof entry.path_summary === "string" ? entry.path_summary : "")
+      );
+      if (!triplets.length && !pathSummary) {
+        return null;
+      }
+      const origin = UNIFIED_GRAPH_ORIGINS.includes(entry.origin) ? entry.origin : undefined;
+      return { ...(origin ? { origin } : {}), pathSummary, triplets };
+    })
+    .filter(Boolean);
+
+  const forcefulRelations = (Array.isArray(response?.forceful_relations) ? response.forceful_relations : [])
+    .map((entry) => {
+      const chunk = normalizeUnifiedChunk(entry?.chunk);
+      if (!chunk) {
+        return null;
+      }
+      return {
+        via: {
+          from: wholeText(redactSecrets(entry?.via?.from == null ? "" : String(entry.via.from))),
+          to: wholeText(redactSecrets(entry?.via?.to == null ? "" : String(entry.via.to)))
+        },
+        chunk
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    layout: "unified",
+    chunks,
+    graph,
+    forcefulRelations,
+    llmPrompt: redactSecrets(response.llm_prompt)
+  };
+}
+
 // Reads the historical snake_case retrieval shape. Its input already arrives
 // snake_cased: recall flows through the wrapper's single normalization seam
 // (scripts/lib/hydra/), which unwraps and snake_cases every SDK response, and
 // the check/golden fixtures are authored snake_case. The polymorphic normalizer
-// is otherwise kept verbatim — it still tolerates the many v1 field spellings.
+// is otherwise kept verbatim (it still tolerates the many v1 field spellings);
+// a unified body is recognised by shape first and takes its own path.
 export function normalizeRetrievalResponse(response) {
+  if (isUnifiedQueryResponse(response)) {
+    return normalizeUnifiedResponse(response);
+  }
   const rawChunks = response?.chunks || response?.results || response?.context || [];
   const chunks = Array.isArray(rawChunks)
     ? rawChunks
@@ -416,16 +559,19 @@ export function isUnifiedLayoutRefusal(error) {
   return UNIFIED_LAYOUT_REFUSAL_RE.test(message);
 }
 
-// PRO-1618: the unified item shape. One memory-shaped record becomes one item
-// (text or a role/content conversation); the field names are the ones the
-// redesign settled on. Exported so the check script can pin the mapping.
+// PRO-1618: the unified item shape (CONTRACT: POST /context/ingest, one item).
+// One memory-shaped record becomes one item, exactly one of `text` or
+// `conversation`, under the contract's names: context_id (was source_id),
+// enrich (was infer), instructions (was custom_instructions), attributes (was
+// tenant_metadata), custom_attributes (was document_metadata). Exported so
+// the check script can pin the mapping.
 //
-// `is_markdown` and `user_name` are carried, not dropped: `is_markdown` changes
-// how the server chunks and renders the body and `user_name` is the
-// attribution, so losing either would make the same file ingest differently
-// depending on the database's layout with nothing in the output to say so.
-// MemoryItem has always had both; items[] gained them in hydradb-application
-// #870.
+// `is_markdown` and `user_name` are not item fields in the contract, so they
+// are not sent as ones. They are not dropped either: both ride inside the
+// free-form `custom_attributes`, so a synced file keeps its rendering hint and
+// a text note keeps its attribution whichever layout it lands on. A
+// conversation's attribution is the per-turn `name`, which IS in the contract
+// and is what the server reads first.
 export function memoryToItem(memory) {
   const item = {};
   const conversation = Array.isArray(memory.user_assistant_pairs)
@@ -435,20 +581,10 @@ export function memoryToItem(memory) {
     item.text = memory.text;
   }
   if (conversation) {
-    // `name` is the per-turn speaker identity on IngestItem.conversation — the
-    // one place the server accepts an attribution.
     item.conversation = conversation.flatMap((pair) => [
       { role: "user", content: pair.user, ...(memory.user_name ? { name: memory.user_name } : {}) },
       { role: "assistant", content: pair.assistant }
     ]);
-  }
-  if (memory.is_markdown != null) {
-    item.is_markdown = memory.is_markdown;
-  }
-  // A conversation's attribution rides on the per-turn `name` above, which is
-  // what the server reads first; only a text item needs the item-level field.
-  if (!conversation && memory.user_name) {
-    item.user_name = memory.user_name;
   }
   if (memory.source_id) {
     item.context_id = memory.source_id;
@@ -458,15 +594,39 @@ export function memoryToItem(memory) {
   }
   item.enrich = memory.infer ?? true;
   if (item.enrich && memory.custom_instructions) {
-    item.custom_instructions = memory.custom_instructions;
+    item.instructions = memory.custom_instructions;
   }
   if (memory.tenant_metadata != null) {
     item.attributes = parseMaybeJson(memory.tenant_metadata);
   }
-  if (memory.document_metadata != null) {
-    item.custom_attributes = parseMaybeJson(memory.document_metadata);
+  const customAttributes = asAttributeMap(parseMaybeJson(memory.document_metadata));
+  if (memory.is_markdown != null) {
+    customAttributes.is_markdown = Boolean(memory.is_markdown);
+  }
+  if (!conversation && memory.user_name) {
+    customAttributes.user_name = memory.user_name;
+  }
+  if (Object.keys(customAttributes).length) {
+    item.custom_attributes = customAttributes;
   }
   return item;
+}
+
+// A parsed metadata value as a fresh plain object, so keys can be added
+// without touching the caller's record (a string that was not JSON parses to
+// `{ value }`; anything that is not an object contributes nothing).
+function asAttributeMap(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+}
+
+// CONTRACT: `happened_at` is the caller's event date as YYYY-MM-DD only. The
+// workspace sync has a full ISO mtime, so the date is cut from it; a value
+// that does not start with a date is left off rather than sent and refused.
+export function toHappenedAt(value) {
+  const text =
+    value instanceof Date ? value.toISOString() : typeof value === "string" ? value.trim() : "";
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(text);
+  return match ? match[1] : "";
 }
 
 // A structured app-knowledge record (the workspace sync's knowledge target) as
@@ -489,8 +649,9 @@ export function appKnowledgeToItem(record) {
   if (record?.title) {
     item.title = record.title;
   }
-  if (record?.timestamp) {
-    item.happened_at = record.timestamp;
+  const happenedAt = toHappenedAt(record?.timestamp);
+  if (happenedAt) {
+    item.happened_at = happenedAt;
   }
   const attributes = record?.metadata ?? record?.tenant_metadata;
   if (attributes != null) {
@@ -523,6 +684,47 @@ function parseMaybeJson(value) {
   } catch {
     return { value };
   }
+}
+
+// The 202 of a unified ingest (CONTRACT): results[].source_id is the context
+// id (the caller's context_id, or the one the server generated) and `infer`
+// echoes enrich. Normalised to the plugin's names so no reader downstream
+// depends on the wire spelling; the raw data stays attached.
+// Every string in the 202 is server-provided and some of it is printed (the
+// context id after `ingest --note`, refusal reasons in the raised error) or
+// returned as JSON, so each is stripped of terminal control sequences,
+// redacted and bounded. Stripping comes first: a control character inside a
+// key would otherwise hide it from the secret patterns and the strip would
+// then join it back together.
+function ingestResponseText(value, maxLength) {
+  return trimText(redactSecrets(stripControlChars(String(value))), maxLength);
+}
+
+export function parseUnifiedIngestResponse(data) {
+  const results = (Array.isArray(data?.results) ? data.results : [])
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => ({
+      contextId: entry.source_id == null ? "" : ingestResponseText(entry.source_id, 200),
+      title: entry.title == null ? null : ingestResponseText(entry.title, 200),
+      status: entry.status == null ? "" : ingestResponseText(entry.status, 40),
+      enrich: Boolean(entry.infer),
+      error: entry.error == null ? null : ingestResponseText(entry.error, 400),
+      errorCode: entry.error_code == null ? null : ingestResponseText(entry.error_code, 80)
+    }));
+  const queued = results.filter((entry) => entry.status === "queued");
+  const failed = results.filter((entry) => entry.status === "failed");
+  const count = (value, fallback) =>
+    value != null && Number.isFinite(Number(value)) ? Number(value) : fallback;
+  return {
+    success: data?.success !== false,
+    message: typeof data?.message === "string" ? ingestResponseText(data.message, 400) : "",
+    successCount: count(data?.success_count, queued.length),
+    failedCount: count(data?.failed_count, failed.length),
+    contextIds: queued.map((entry) => entry.contextId).filter(Boolean),
+    failed,
+    results,
+    raw: data ?? null
+  };
 }
 
 export class HydraClient {
@@ -587,28 +789,71 @@ export class HydraClient {
   }
 
   // One ranked list over everything in a unified database (no corpus selector).
+  //
+  // The answer must be the four-key body. Anything else (a body that still
+  // names the forceful-relations bucket `relations`, or a v2 body) is refused
+  // here with a named error, so it lands in the recall's errors rather than
+  // reaching the readers as a result without graph/forcefulRelations.
   async recallUnified(query, options = {}) {
-    return normalizeRetrievalResponse(
-      await this._hydra.context.query(
-        {
-          query,
-          kind: "unified",
-          mode: options.mode || "fast",
-          maxResults: options.maxResults || 6,
-          alpha: 0.8,
-          recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true
-        },
-        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
-      )
+    const data = await this._hydra.context.query(
+      {
+        query,
+        kind: "unified",
+        mode: options.mode || "fast",
+        maxResults: options.maxResults || 6,
+        alpha: 0.8,
+        recencyBias: options.recencyBias ?? 0,
+        graphContext: options.graphContext ?? true,
+        ...(options.followForcefulRelations != null
+          ? { followForcefulRelations: options.followForcefulRelations }
+          : {})
+      },
+      { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
     );
+    if (!isUnifiedQueryResponse(data)) {
+      throw new Error(
+        "/query on a unified database did not answer with the unified body " +
+          "(chunks[], graph[], forceful_relations[], llm_prompt)"
+      );
+    }
+    return normalizeUnifiedResponse(data);
   }
 
+  // One unified write (CONTRACT: POST /context/ingest as a JSON body whose
+  // list key is `context`), with the request-level enrich/upsert/instructions
+  // defaults when the caller sets them. Returns the parsed 202.
+  //
+  // A 202 is per item: the server queues what it can and names the rest in
+  // results[] with status "failed". That is not a success for the caller.
+  // The workspace sync records a file as synced as soon as the write returns
+  // and skips it on every later sync while its digest is unchanged, so a
+  // refused item that came back as a return value would be lost for good.
+  // It is raised instead, the way a split database's 4xx is, with the context
+  // ids and reasons in the message and the parsed 202 attached as `ingest`.
   async addItems(items, options = {}) {
-    return this._hydra.context.ingest(
-      { items, upsert: options.upsert ?? true },
+    const data = await this._hydra.context.ingest(
+      {
+        context: items,
+        upsert: options.upsert ?? true,
+        ...(options.enrich != null ? { enrich: options.enrich } : {}),
+        ...(options.instructions != null ? { instructions: options.instructions } : {})
+      },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
+    const parsed = parseUnifiedIngestResponse(data);
+    if (parsed.failed.length || parsed.failedCount > 0 || !parsed.success) {
+      const refused = parsed.failed.length || parsed.failedCount;
+      const reasons = parsed.failed.map(
+        (entry) => `${entry.contextId || "(no id)"}: ${entry.error || entry.errorCode || "unknown error"}`
+      );
+      const detail = reasons.length ? reasons.join("; ") : parsed.message || "no reason given";
+      const error = new Error(
+        `/context/ingest refused ${refused} of ${parsed.results.length || items.length} items: ${detail}`
+      );
+      error.ingest = parsed;
+      throw error;
+    }
+    return parsed;
   }
 
   async recallMemories(query, options = {}) {
@@ -766,7 +1011,7 @@ export class HydraClient {
       items.push(item);
     }
     if (!items.length) {
-      return { success_count: 0, failed_count: 0 };
+      return parseUnifiedIngestResponse({ success: true, results: [], success_count: 0, failed_count: 0 });
     }
     return this.addItems(items, { upsert: true });
   }

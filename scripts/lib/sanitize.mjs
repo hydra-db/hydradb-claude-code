@@ -47,6 +47,16 @@ export function redactSecrets(text) {
   return redacted;
 }
 
+// Terminal escape sequences (CSI and OSC) and the remaining C0/C1 control
+// characters. Server-provided values that are printed to a terminal go
+// through this so a response cannot rewrite what the user sees.
+const TERMINAL_CONTROL_RE =
+  /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[\u0000-\u001f\u007f-\u009f]/g;
+
+export function stripControlChars(text) {
+  return String(text ?? "").replace(TERMINAL_CONTROL_RE, "");
+}
+
 export function wasRedacted(original, redacted) {
   return normalizeText(original) !== normalizeText(redacted);
 }
