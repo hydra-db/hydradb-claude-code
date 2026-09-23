@@ -53,11 +53,38 @@ function chooseVersionedField(previous, next, field, timestampField) {
   };
 }
 
-function mergeSession(previous, next) {
+// Queued turn captures are merged by source id, not replaced wholesale, so
+// two overlapping Stop hooks cannot drop each other's queued turn. An entry
+// leaves the queue only when a writer names it in `removedTurnCaptures` (it
+// was saved, or dropped past the cap). Kept oldest first by source id time.
+function turnCaptureTime(entry) {
+  const match = /:(\d+)$/.exec(entry?.sourceId || "");
+  return match ? Number(match[1]) : 0;
+}
+
+function mergeTurnCaptures(previous, next, removed) {
+  const byId = new Map();
+  for (const entry of [...(previous || []), ...(next || [])]) {
+    if (entry && typeof entry.sourceId === "string" && !removed.has(entry.sourceId)) {
+      byId.set(entry.sourceId, entry);
+    }
+  }
+  return [...byId.values()].sort((a, b) => turnCaptureTime(a) - turnCaptureTime(b));
+}
+
+function mergeSession(previous, next, removedTurnCaptures = new Set()) {
   const merged = {
     ...previous,
     ...next
   };
+
+  if (Array.isArray(previous?.pendingTurnCaptures) || Array.isArray(next?.pendingTurnCaptures)) {
+    merged.pendingTurnCaptures = mergeTurnCaptures(
+      previous?.pendingTurnCaptures,
+      next?.pendingTurnCaptures,
+      removedTurnCaptures
+    );
+  }
 
   const pendingPrompt = chooseVersionedField(previous, next, "pendingPrompt", "pendingPromptUpdatedAt");
   if (pendingPrompt.value !== undefined || pendingPrompt.timestamp) {
@@ -136,7 +163,10 @@ export async function readState(dataDir) {
 // never drop one. Without an explicit removal list, a file deleted from the
 // in-memory state is resurrected from `current` on every write, so a deleted
 // source stays tracked forever and every full sync re-attempts its delete.
-export async function writeState(dataDir, state, { removedFilePaths = [] } = {}) {
+// `removedTurnCaptures` does the same for queued turn captures (source ids
+// this write saved or dropped); see mergeTurnCaptures.
+export async function writeState(dataDir, state, { removedFilePaths = [], removedTurnCaptures = [] } = {}) {
+  const removedTurns = new Set(removedTurnCaptures);
   await ensureDataDir(dataDir);
   const statePath = path.join(dataDir, "state.json");
   const current = await readState(dataDir);
@@ -148,7 +178,7 @@ export async function writeState(dataDir, state, { removedFilePaths = [] } = {})
     [...sessionIds].map((sessionId) => {
       const previous = current.sessions?.[sessionId] || {};
       const next = state.sessions?.[sessionId] || {};
-      return [sessionId, mergeSession(previous, next)];
+      return [sessionId, mergeSession(previous, next, removedTurns)];
     })
   );
 

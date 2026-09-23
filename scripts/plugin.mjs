@@ -375,7 +375,7 @@ const MAX_PENDING_TURN_CAPTURES = 20;
 // costs one timed-out request, not one per queued turn.
 const STOP_RETRY_BUDGET_MS = 8_000;
 
-async function retryPendingTurnCaptures({ client, configResult, sessionId, session, errors, deadline, persist }) {
+async function retryPendingTurnCaptures({ client, configResult, sessionId, session, errors, deadline, persist, removed }) {
   const pending = Array.isArray(session.pendingTurnCaptures) ? session.pendingTurnCaptures : [];
   while (pending.length && Date.now() < deadline) {
     const entry = pending[0];
@@ -392,17 +392,18 @@ async function retryPendingTurnCaptures({ client, configResult, sessionId, sessi
       errors.push(`turn capture retry ${entry.sourceId}: ${error.message}`);
       break;
     }
-    pending.shift();
+    removed.add(pending.shift().sourceId);
     session.pendingTurnCaptures = pending;
     await persist();
   }
 }
 
-function queueFailedTurnCapture(session, entry, errors) {
+function queueFailedTurnCapture(session, entry, errors, removed) {
   const pending = Array.isArray(session.pendingTurnCaptures) ? session.pendingTurnCaptures : [];
   pending.push(entry);
   while (pending.length > MAX_PENDING_TURN_CAPTURES) {
     const dropped = pending.shift();
+    removed.add(dropped.sourceId);
     errors.push(`turn capture ${dropped.sourceId} dropped after ${MAX_PENDING_TURN_CAPTURES} pending retries`);
   }
   session.pendingTurnCaptures = pending;
@@ -676,9 +677,12 @@ async function handleStop() {
   // the hashes of only what was actually saved) is always written, so the
   // next Stop retries what failed.
   const captureErrors = [];
+  // Source ids this hook saved or dropped: the only ones a write may take off
+  // the queue, so an overlapping Stop's newly queued turn survives the merge.
+  const removedTurnCaptures = new Set();
+  const persist = () => writeState(dataDir, state, { removedTurnCaptures: [...removedTurnCaptures] });
   if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
     const deadline = Date.now() + STOP_RETRY_BUDGET_MS;
-    const persist = () => writeState(dataDir, state);
     let reachable = true;
     if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
       const sourceId = `claude-turn:${sessionId}:${Date.now()}`;
@@ -689,10 +693,11 @@ async function handleStop() {
       // both move together) so the next Stop does not capture it twice.
       session.lastCaptureHash = captureHash;
       session.lastCaptureUpdatedAt = new Date().toISOString();
-      queueFailedTurnCapture(session, entry, captureErrors);
+      queueFailedTurnCapture(session, entry, captureErrors, removedTurnCaptures);
       await persist();
       try {
         await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId });
+        removedTurnCaptures.add(sourceId);
         session.pendingTurnCaptures = session.pendingTurnCaptures.filter((pending) => pending.sourceId !== sourceId);
         await persist();
       } catch (error) {
@@ -701,7 +706,9 @@ async function handleStop() {
       }
     }
     if (reachable) {
-      await retryPendingTurnCaptures({ client, configResult, sessionId, session, errors: captureErrors, deadline, persist });
+      await retryPendingTurnCaptures({
+        client, configResult, sessionId, session, errors: captureErrors, deadline, persist, removed: removedTurnCaptures
+      });
     }
   }
 
@@ -716,7 +723,7 @@ async function handleStop() {
     }
   }
 
-  await writeState(dataDir, state);
+  await persist();
 
   if (captureErrors.length) {
     await appendDebugLog(dataDir, configResult.config.debug, "stop-capture-error", { errors: captureErrors });

@@ -17,6 +17,7 @@ import {
 import { syncWorkspace, UNIFIED_MAX_CHUNK_CHARS } from "../scripts/lib/workspace-sync.mjs";
 import { UNIFIED_QUERY_META, UNIFIED_QUERY_RESPONSE } from "./fixtures.mjs";
 import { capturingFetch, SCOPE } from "./tests.mjs";
+import { readState, writeState } from "../scripts/lib/state.mjs";
 
 // The keys the strict decoder accepts (unified_ingest.go acceptedFieldNames).
 const REQUEST_KEYS = new Set(["database", "collection", "context", "upsert", "enrich", "instructions", "graph_payload"]);
@@ -356,6 +357,29 @@ export async function runUnifiedFixTests() {
     assert.ok(JSON.stringify(payload).length <= QUERY_JSON_CHARS, `bounded (${JSON.stringify(payload).length})`);
     assert.deepEqual(payload.unified.chunks.map((c) => c.contextId), unified.chunks.map((_, i) => `c${i}`), "every chunk id kept");
     assert.ok(payload.unified.chunks.every((c) => c.score === 0.5), "scores kept");
+    tests += 1;
+  }
+
+  // 12) Greptile on #14: overlapping Stop hooks merge queued turns by source
+  // id, so neither drops the turn the other just queued, and a saved turn
+  // leaves the queue only through the writer that saved it.
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-turnq-"));
+    const turn = (t) => ({ user: `u${t}`, assistant: `a${t}`, sourceId: `claude-turn:s:${t}` });
+    await writeState(dir, { sessions: { s: { pendingTurnCaptures: [turn(1)] } } });
+    const hookA = await readState(dir);
+    const hookB = await readState(dir);
+    hookA.sessions.s.pendingTurnCaptures.push(turn(2));
+    hookB.sessions.s.pendingTurnCaptures.push(turn(3));
+    await writeState(dir, hookA);
+    await writeState(dir, hookB);
+    let ids = (await readState(dir)).sessions.s.pendingTurnCaptures.map((e) => e.sourceId);
+    assert.deepEqual(ids, ["claude-turn:s:1", "claude-turn:s:2", "claude-turn:s:3"], "both queued turns survive");
+    hookA.sessions.s.pendingTurnCaptures = hookA.sessions.s.pendingTurnCaptures.filter((e) => e.sourceId !== "claude-turn:s:1");
+    await writeState(dir, hookA, { removedTurnCaptures: ["claude-turn:s:1"] });
+    ids = (await readState(dir)).sessions.s.pendingTurnCaptures.map((e) => e.sourceId);
+    assert.deepEqual(ids, ["claude-turn:s:2", "claude-turn:s:3"], "only the saved turn is removed");
+    await fs.rm(dir, { recursive: true, force: true });
     tests += 1;
   }
 
