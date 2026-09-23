@@ -889,11 +889,13 @@ async function handleSaveSession(args) {
 }
 
 // PRO-2193: the query skill's output reaches the model through a tool result,
-// which the host truncates too. A unified recall is held to QUERY_OUTPUT_CHARS
-// (the prompt fitted without losing a citation) and each chunk body to
-// QUERY_CHUNK_CHARS, flagged; a split recall is printed as before.
-const QUERY_OUTPUT_CHARS = 20_000;
-const QUERY_CHUNK_CHARS = 2_000;
+// which the host truncates too (~30k characters). A unified recall carries the
+// same text twice (llm_prompt and chunks[]), so the prompt is held to
+// QUERY_OUTPUT_CHARS (fitted without losing a citation) and each chunk body to
+// QUERY_CHUNK_CHARS, flagged with its full length; together they stay well
+// under the host's cut. A split recall is printed as before.
+const QUERY_OUTPUT_CHARS = 12_000;
+const QUERY_CHUNK_CHARS = 800;
 
 function boundUnifiedRecall(unified) {
   if (!unified || typeof unified !== "object") {
