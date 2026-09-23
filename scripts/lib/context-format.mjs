@@ -265,33 +265,125 @@ export function buildUnifiedStructuredString(result) {
   return lines.join("\n").trim();
 }
 
-// What the model sees for a unified recall: the server-built llm_prompt, as it
-// came. It is markdown and numbers what the model is told to cite (results
-// `### 1.`, forceful relations `### R1.`, related facts `[P1]`, cited in
-// brackets as [1] / [R1] / [P1]), so it is never re-formatted here and never
-// compacted: the only touch is the secret redaction applied at normalisation.
-// The maxContextChars budget does not apply to it (see buildHydraContextBlock).
-// The structured rendering is used only if a server sent no prompt at all, so
-// a result is never silently dropped.
-export function buildUnifiedContextString(result) {
+// Cut `text` to at most `max` characters at a word boundary; undefined when it fits.
+function cutAtWord(text, max) {
+  if (text.length <= max) {
+    return undefined;
+  }
+  const head = text.slice(0, max);
+  const space = head.lastIndexOf(" ");
+  return (space > max * 0.6 ? head.slice(0, space) : head).trimEnd();
+}
+
+// PRO-2193: fit a unified recall's llm_prompt into `maxChars` without losing a
+// citation. Claude Code moves hook additionalContext past ~10k characters to a
+// file and shows the model a preview, so an unbounded prompt lost exactly the
+// [1]/[R1]/[P1] labels it is built around.
+//
+// The server writes each result's content and enrichment into the prompt
+// verbatim (and normalisation redacts both the same way), and that text can
+// itself be Markdown, so the prompt's lines are not parsed for structure. The
+// recall's own chunks say which text is result body: it is found in the prompt
+// and shortened in place, sharing the room left by everything else, each cut
+// marked. Headings, ids, labels and the related-facts section are never
+// touched. If the prompt is still over budget, it is cut at a line with a
+// note, so the bound always holds. A prompt that fits is returned untouched.
+export function fitUnifiedPrompt(result, maxChars) {
+  const prompt = typeof result?.llmPrompt === "string" ? result.llmPrompt : "";
+  if (prompt.length <= maxChars) {
+    return prompt;
+  }
+  const chunks = [
+    ...(Array.isArray(result?.chunks) ? result.chunks : []),
+    ...(Array.isArray(result?.forcefulRelations) ? result.forcefulRelations.map((r) => r?.chunk).filter(Boolean) : [])
+  ];
+  const bodies = [];
+  for (const chunk of chunks) {
+    for (const raw of [chunk.content, chunk.enrichment]) {
+      const text = typeof raw === "string" ? raw.trim() : "";
+      if (text) {
+        bodies.push({ id: chunk.contextId || "", text });
+      }
+    }
+  }
+  const located = [];
+  let cursor = 0;
+  for (const body of bodies) {
+    let at = prompt.indexOf(body.text, cursor);
+    if (at < 0) {
+      at = prompt.indexOf(body.text);
+    }
+    if (at < 0 || located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
+      continue;
+    }
+    located.push({ ...body, at });
+    cursor = at + body.text.length;
+  }
+
+  const noteAllowance = 90;
+  const fixed = prompt.length - located.reduce((n, l) => n + l.text.length, 0);
+  let cap = Number.POSITIVE_INFINITY;
+  if (located.length) {
+    let room = Math.max(0, maxChars - fixed - noteAllowance * located.length);
+    const sorted = located.map((l) => l.text.length).sort((x, y) => x - y);
+    let fill = room / sorted.length;
+    for (let i = 0; i < sorted.length && sorted[i] <= fill; i += 1) {
+      room -= sorted[i];
+      fill = sorted.length - i - 1 > 0 ? room / (sorted.length - i - 1) : fill;
+    }
+    cap = Math.max(120, Math.floor(fill));
+  }
+
+  let text = "";
+  let from = 0;
+  for (const l of [...located].sort((x, y) => x.at - y.at)) {
+    const cut = cutAtWord(l.text, cap);
+    text += prompt.slice(from, l.at);
+    from = l.at + l.text.length;
+    text += cut === undefined
+      ? l.text
+      : `${cut} … [shortened: ${cut.length} of ${l.text.length} characters${l.id ? `, id ${l.id}` : ""}]`;
+  }
+  text += prompt.slice(from);
+
+  if (text.length > maxChars) {
+    const note = "\n[recall cut to fit the context budget]";
+    const head = text.slice(0, Math.max(0, maxChars - note.length));
+    const lastLine = head.lastIndexOf("\n");
+    text = (lastLine > head.length * 0.8 ? head.slice(0, lastLine) : head) + note;
+  }
+  return text;
+}
+
+// What the model sees for a unified recall: the server-built llm_prompt. It is
+// markdown and numbers what the model is told to cite (results `### 1.`,
+// forceful relations `### R1.`, related facts `[P1]`, cited in brackets as
+// [1] / [R1] / [P1]), so it is never re-formatted here; with `maxChars` it is
+// fitted by fitUnifiedPrompt, which shortens only result bodies. The
+// structured rendering is used only if a server sent no prompt at all, so a
+// result is never silently dropped.
+export function buildUnifiedContextString(result, maxChars) {
   if (!result || typeof result !== "object") {
     return "";
   }
   const llmPrompt = typeof result.llmPrompt === "string" ? result.llmPrompt : "";
   if (llmPrompt.trim()) {
-    return llmPrompt;
+    return maxChars ? fitUnifiedPrompt(result, maxChars) : llmPrompt;
   }
-  return buildUnifiedStructuredString(result);
+  const structured = buildUnifiedStructuredString(result);
+  return maxChars ? truncateText(structured, maxChars) : structured;
 }
 
 export function buildHydraContextBlock({ query, unified, memory, knowledge, errors, maxContextChars }) {
   const sections = [];
 
   // PRO-1618: a unified database answers with the four-key body; the section
-  // is its llm_prompt, verbatim, in place of the MEMORY/KNOWLEDGE split. It is
-  // injected whole: the maxContextChars budget below applies to the split
-  // MEMORY/KNOWLEDGE sections only.
-  const unifiedSection = wholeText(buildUnifiedContextString(unified));
+  // is its llm_prompt in place of the MEMORY/KNOWLEDGE split, held to the same
+  // maxContextChars budget (fitted without losing a citation, PRO-2193).
+  const headerAllowance = 520;
+  const unifiedSection = wholeText(
+    buildUnifiedContextString(unified, Math.max(256, (maxContextChars || 7000) - headerAllowance))
+  );
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {
     const section = buildContextString("MEMORY", memory);
@@ -332,7 +424,8 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
     256,
     (maxContextChars || 7000) - lines.join("\n").length - footer.length - 2
   );
-  const body = [unifiedSection, sections.length ? truncateText(sections.join("\n\n"), maxBodyChars) : ""]
+  const splitRoom = Math.max(256, maxBodyChars - (unifiedSection ? unifiedSection.length + 2 : 0));
+  const body = [unifiedSection, sections.length ? truncateText(sections.join("\n\n"), splitRoom) : ""]
     .filter(Boolean)
     .join("\n\n");
   lines.push(body);

@@ -7,10 +7,12 @@ import path from "node:path";
 import process from "node:process";
 
 import { formatStatus, loadConfig, PROJECT_CONFIG_FILES } from "./lib/config.mjs";
-import { buildHydraContextBlock, buildUnifiedStructuredString } from "./lib/context-format.mjs";
+import { buildHydraContextBlock, buildUnifiedStructuredString, fitUnifiedPrompt } from "./lib/context-format.mjs";
 import {
   combineRecallErrors,
+  clipUtf8,
   DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
+  UNIFIED_MAX_ITEM_TEXT_BYTES,
   EMPTY_UNIFIED_RECALL,
   HydraClient
 } from "./lib/hydra-client.mjs";
@@ -162,7 +164,9 @@ async function getRuntime() {
         tenantId: configResult.config.tenantId,
         subTenantId: configResult.config.subTenantId,
         requestTimeoutMs: configResult.config.requestTimeoutMs,
-        writeTimeoutMs: configResult.config.writeTimeoutMs
+        writeTimeoutMs: configResult.config.writeTimeoutMs,
+        layoutCacheFile: dataDir ? path.join(dataDir, "layout-cache.json") : undefined,
+        onDebug: (event, payload) => appendDebugLog(dataDir, configResult.config.debug, event, payload)
       })
     : null;
 
@@ -197,19 +201,36 @@ function resolveSessionId(args, state) {
   return explicit || state.lastSessionId || "";
 }
 
-function renderSessionTranscript(sessionId, session, workspaceName) {
-  const turns = Array.isArray(session.turns) ? session.turns : [];
+// `maxBytes` (a unified database's per-item text limit) keeps the latest
+// turns and drops the oldest, naming how many were left out; without it the
+// transcript is rendered exactly as before.
+function renderSessionTranscript(sessionId, session, workspaceName, maxBytes) {
+  const allTurns = Array.isArray(session.turns) ? session.turns : [];
+  if (maxBytes) {
+    for (let skip = 0; skip < allTurns.length; skip += 1) {
+      const text = renderTranscriptTurns(sessionId, allTurns.slice(skip), workspaceName, skip);
+      if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+        return text;
+      }
+    }
+    return clipUtf8(renderTranscriptTurns(sessionId, allTurns.slice(-1), workspaceName, allTurns.length - 1), maxBytes);
+  }
+  return renderTranscriptTurns(sessionId, allTurns, workspaceName, 0);
+}
+
+function renderTranscriptTurns(sessionId, turns, workspaceName, omitted) {
   const header = [
     `# Claude Code session`,
     ``,
     `session_id: ${sessionId}`,
     `workspace: ${workspaceName}`,
-    `turn_count: ${turns.length}`
+    `turn_count: ${turns.length + omitted}`,
+    ...(omitted ? [`omitted_turns: ${omitted} (oldest, to fit the size limit)`] : [])
   ];
 
   const body = turns.flatMap((turn, index) => [
     ``,
-    `## Turn ${index + 1}`,
+    `## Turn ${index + 1 + omitted}`,
     ``,
     `### User`,
     turn.user,
@@ -339,7 +360,8 @@ async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, as
 }
 
 async function autoUpsertSession({ client, configResult, sessionId, session }) {
-  const transcript = renderSessionTranscript(sessionId, session, configResult.workspaceName);
+  const maxBytes = (await client.isUnified()) ? UNIFIED_MAX_ITEM_TEXT_BYTES - 1024 : undefined;
+  const transcript = renderSessionTranscript(sessionId, session, configResult.workspaceName, maxBytes);
   const transcriptHash = digest(transcript);
   if (session.lastSessionTranscriptHash === transcriptHash) {
     return false;
@@ -600,11 +622,20 @@ async function handleStop() {
     return;
   }
 
+  // A refused or failed write must not lose the turn: the error is reported,
+  // the other capture still runs, and the state (with this turn appended and
+  // the hashes of only what was actually saved) is always written, so the
+  // next Stop retries what failed.
+  const captureErrors = [];
   if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
     if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
-      await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText });
-      session.lastCaptureHash = captureHash;
-      session.lastCaptureUpdatedAt = new Date().toISOString();
+      try {
+        await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText });
+        session.lastCaptureHash = captureHash;
+        session.lastCaptureUpdatedAt = new Date().toISOString();
+      } catch (error) {
+        captureErrors.push(`turn capture: ${error.message}`);
+      }
     }
   }
 
@@ -612,10 +643,19 @@ async function handleStop() {
     configResult.config.captureMode === "session-upsert" ||
     configResult.config.captureMode === "both"
   ) {
-    await autoUpsertSession({ client, configResult, sessionId, session });
+    try {
+      await autoUpsertSession({ client, configResult, sessionId, session });
+    } catch (error) {
+      captureErrors.push(`session upsert: ${error.message}`);
+    }
   }
 
   await writeState(dataDir, state);
+
+  if (captureErrors.length) {
+    await appendDebugLog(dataDir, configResult.config.debug, "stop-capture-error", { errors: captureErrors });
+    process.stderr.write(`[hydradb] capture failed, will retry on the next turn: ${captureErrors.join("; ")}\n`);
+  }
 }
 
 async function handlePostToolUse() {
@@ -815,7 +855,8 @@ async function handleSaveSession(args) {
   const transcript = renderSessionTranscript(
     sessionId,
     session,
-    runtime.configResult.workspaceName
+    runtime.configResult.workspaceName,
+    (await runtime.client.isUnified()) ? UNIFIED_MAX_ITEM_TEXT_BYTES - 1024 : undefined
   );
 
   const stored = await runtime.client.addTextMemory(transcript, {
@@ -847,6 +888,33 @@ async function handleSaveSession(args) {
   );
 }
 
+// PRO-2193: the query skill's output reaches the model through a tool result,
+// which the host truncates too. A unified recall is held to QUERY_OUTPUT_CHARS
+// (the prompt fitted without losing a citation) and each chunk body to
+// QUERY_CHUNK_CHARS, flagged; a split recall is printed as before.
+const QUERY_OUTPUT_CHARS = 20_000;
+const QUERY_CHUNK_CHARS = 2_000;
+
+function boundUnifiedRecall(unified) {
+  if (!unified || typeof unified !== "object") {
+    return unified;
+  }
+  const boundChunk = (chunk) => {
+    if (!chunk || typeof chunk.content !== "string" || chunk.content.length <= QUERY_CHUNK_CHARS) {
+      return chunk;
+    }
+    return { ...chunk, content: chunk.content.slice(0, QUERY_CHUNK_CHARS), contentTruncated: true, contentChars: chunk.content.length };
+  };
+  return {
+    ...unified,
+    ...(typeof unified.llmPrompt === "string" ? { llmPrompt: fitUnifiedPrompt(unified, QUERY_OUTPUT_CHARS) } : {}),
+    chunks: Array.isArray(unified.chunks) ? unified.chunks.map(boundChunk) : unified.chunks,
+    forcefulRelations: Array.isArray(unified.forcefulRelations)
+      ? unified.forcefulRelations.map((r) => (r && r.chunk ? { ...r, chunk: boundChunk(r.chunk) } : r))
+      : unified.forcefulRelations
+  };
+}
+
 function renderRecallText(result) {
   const lines = [];
 
@@ -855,7 +923,11 @@ function renderRecallText(result) {
     // context_id/score/content/enrichment, forceful relations, graph path
     // summaries. The --json payload carries llmPrompt for the model.
     const structured = buildUnifiedStructuredString(result.unified);
-    lines.push(structured || "Context:\n- none");
+    lines.push(
+      structured.length > QUERY_OUTPUT_CHARS
+        ? `${structured.slice(0, QUERY_OUTPUT_CHARS)}\n[output cut at ${QUERY_OUTPUT_CHARS} characters]`
+        : structured || "Context:\n- none"
+    );
   }
 
   if (result.searchMode === "memory" || result.searchMode === "both") {
@@ -905,9 +977,11 @@ async function handleRecall(args, commandName = "recall") {
     throw new Error("HydraDB is not configured");
   }
 
+  const recall = await performRecall(runtime.client, runtime.configResult.config, query);
   const payload = {
     query,
-    ...(await performRecall(runtime.client, runtime.configResult.config, query))
+    ...recall,
+    ...(recall.unified ? { unified: boundUnifiedRecall(recall.unified) } : {})
   };
 
   if (jsonMode) {
