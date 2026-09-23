@@ -1255,7 +1255,7 @@ export async function runHttpTests() {
     assert.deepEqual(JSON.parse(sink.at(-1).bodyString), { database: "new_db", type: "unified" });
   }
 
-  return { tests: 28 };
+  return { tests: 29 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
