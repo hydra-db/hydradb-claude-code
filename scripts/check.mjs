@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { runConformance } from "../conformance/runner.mjs";
 import { runGoldenTests, runHttpTests } from "../conformance/tests.mjs";
+import { runUnifiedFixTests } from "../conformance/unified-fixes.mjs";
 import { appKnowledgeToItem, memoryToItem, normalizeRetrievalResponse } from "./lib/hydra-client.mjs";
 import { syncWorkspace } from "./lib/workspace-sync.mjs";
 
@@ -120,10 +121,11 @@ assert.deepEqual(
   }),
   {
     conversation: [
-      { role: "user", content: "I prefer dark mode", name: "Ada" },
+      { role: "user", content: "I prefer dark mode" },
       { role: "assistant", content: "Noted" }
     ],
     context_id: "claude-turn:1",
+    user_name: "Ada",
     enrich: true,
     instructions: "focus",
     attributes: { topic: "ui" }
@@ -413,10 +415,11 @@ assert.equal(bareNodeOut, "BARE_NODE_OK", "vendored bundle failed to load on bar
 const conformanceResult = await runConformance();
 const httpResult = await runHttpTests();
 const goldenResult = await runGoldenTests(root);
+const unifiedFixResult = await runUnifiedFixTests();
 
 process.stdout.write(
   `Validated ${scriptFiles.length} core scripts, ${jsonFiles.length} JSON files, recall normalization, ` +
     `hook output, last-recall state, config defaults, the vendored SDK bundle (drift + bare-node load), ` +
     `${conformanceResult.ran} conformance vectors, ${httpResult.tests} HTTP-level wire tests, and ` +
-    `${goldenResult.golden} golden --json shapes.\n`
+    `${goldenResult.golden} golden --json shapes, and ${unifiedFixResult.tests} unified-fix wire tests.\n`
 );

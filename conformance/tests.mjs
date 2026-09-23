@@ -55,7 +55,7 @@ function fakeResponse(payload) {
 
 // Capturing fetch: records each outgoing request in a wire-level view and
 // answers with a canned envelope chosen by the responder.
-function capturingFetch(sink, responder) {
+export function capturingFetch(sink, responder) {
   return async (url, init = {}) => {
     const parsed = new URL(url);
     const httpMethod = (init.method || "GET").toUpperCase();
@@ -84,7 +84,7 @@ function capturingFetch(sink, responder) {
   };
 }
 
-const SCOPE = { apiKey: "test-key", tenantId: "db_test", subTenantId: "col_test" };
+export const SCOPE = { apiKey: "test-key", tenantId: "db_test", subTenantId: "col_test" };
 
 export async function runHttpTests() {
   // 1) DX-G-002: knowledge ingest MUST be multipart with a top-level tenant_id
@@ -456,7 +456,11 @@ export async function runHttpTests() {
     const oldKeyBody = { ...withoutBucket, relations: bucket };
     assert.equal(isUnifiedQueryResponse(UNIFIED_QUERY_RESPONSE), true);
     assert.equal(isUnifiedQueryResponse(oldKeyBody), false, "`relations` is not read as forceful_relations");
-    assert.equal(isUnifiedQueryResponse(withoutBucket), false, "forceful_relations[] is required");
+    assert.equal(
+      isUnifiedQueryResponse(withoutBucket),
+      true,
+      "forceful_relations is optional in the contract: absent reads as none (PRO-2193)"
+    );
     assert.equal(
       isUnifiedQueryResponse({ ...UNIFIED_QUERY_RESPONSE, forceful_relations: {} }),
       false,
@@ -474,7 +478,7 @@ export async function runHttpTests() {
     });
     await assert.rejects(
       () => client.recallUnified("acme"),
-      /did not answer with the unified body \(chunks\[\], graph\[\], forceful_relations\[\], llm_prompt\)/,
+      /answered with neither the unified body \(chunks\[\], graph\[\], llm_prompt\) nor the v2 body/,
       "a body with the old key is refused, not read"
     );
   }
@@ -635,12 +639,15 @@ export async function runHttpTests() {
       errors: [],
       maxContextChars: 7000
     });
-    assert.ok(block.length > 20000, "maxContextChars does not cap a unified block");
-    assert.ok(block.includes(`\n${unified.llmPrompt}\n</hydradb-context>`), "the whole llm_prompt is injected");
-    assert.ok(block.includes("END-OF-PROMPT"));
+    // PRO-2193: the injected block is held to maxContextChars (Claude Code
+    // moves hook context past ~10k characters to a file and shows a preview,
+    // which cut the citations off). The normalised result above stays whole;
+    // only what is injected is fitted.
+    assert.ok(block.length <= 7000, `a unified block is held to maxContextChars (${block.length})`);
+    assert.ok(block.startsWith("<hydradb-context>") && block.endsWith("</hydradb-context>"), "the wrapper is kept");
     assert.ok(!block.includes(secret), "secret redaction still applies");
 
-    // With no llm_prompt the structured fallback is injected, whole too.
+    // With no llm_prompt the structured fallback is injected, bounded the same way.
     const fallback = buildHydraContextBlock({
       query: "q",
       unified: { ...unified, llmPrompt: "" },
@@ -649,9 +656,7 @@ export async function runHttpTests() {
       errors: [],
       maxContextChars: 7000
     });
-    for (const text of [content, enrichment, temporal, summary]) {
-      assert.ok(fallback.includes(text), "the structured fallback is not truncated");
-    }
+    assert.ok(fallback.length <= 7000, `the structured fallback is bounded too (${fallback.length})`);
 
     const structured = buildUnifiedStructuredString(unified);
     assert.ok(structured.includes(`\n${content}\n`), "structured content is whole");
@@ -757,7 +762,8 @@ export async function runHttpTests() {
               data: {
                 success: true,
                 message: "queued",
-                results: [{ source_id: "m1", title: "Prefs", status: "queued", infer: true, error: null, error_code: null }],
+                // Staging names the context `id` (V2MemoryResultItem).
+                results: [{ id: "m1", title: "Prefs", status: "queued", infer: true, error: null, error_code: null }],
                 success_count: 1,
                 failed_count: 0
               },
@@ -787,12 +793,13 @@ export async function runHttpTests() {
           title: "Prefs",
           enrich: true,
           instructions: "focus",
-          custom_attributes: { is_markdown: true, user_name: "Ada" }
+          user_name: "Ada",
+          custom_attributes: { is_markdown: true }
         }
       ],
       upsert: true
     });
-    assert.deepEqual(stored.contextIds, ["m1"], "results[].source_id is the context id");
+    assert.deepEqual(stored.contextIds, ["m1"], "results[].id is the context id");
     assert.equal(stored.successCount, 1);
     assert.equal(stored.failedCount, 0);
     assert.deepEqual(stored.failed, []);
@@ -807,11 +814,14 @@ export async function runHttpTests() {
       collection: "col_test",
       context: [
         {
+          // A turn is exactly {role, content} (strict decoder, #1653); the
+          // speaker is the item's user_name.
           conversation: [
-            { role: "user", content: "I prefer dark mode", name: "Ada" },
+            { role: "user", content: "I prefer dark mode" },
             { role: "assistant", content: "Noted" }
           ],
           context_id: "claude-turn:1",
+          user_name: "Ada",
           enrich: true,
           instructions: "focus"
         }
@@ -909,9 +919,10 @@ export async function runHttpTests() {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-ingest-refused-"));
     await fs.writeFile(path.join(dir, "NOTES.md"), "# Notes\n", "utf8");
     const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
-    await assert.rejects(
-      () =>
-        syncWorkspace({
+    // PRO-2193: a refused batch no longer aborts the sync. It is reported,
+    // its files are left unsynced (so the next sync retries them), and the
+    // other batches still go.
+    const refusedSummary = await syncWorkspace({
           client,
           config: {
             includeGlobs: ["*.md"],
@@ -928,9 +939,9 @@ export async function runHttpTests() {
           projectRoot: dir,
           workspaceName: "t",
           state
-        }),
-      /refused/
-    );
+        });
+    assert.ok(refusedSummary.errors.some((e) => /refused/.test(e)), "the refusal is reported");
+    assert.deepEqual(refusedSummary.failedFiles.map((f) => f.path), ["NOTES.md"], "the file is named as failed");
     assert.deepEqual(state.files, {}, "a refused write must not record the file as synced");
   }
 
@@ -1089,16 +1100,16 @@ export async function runHttpTests() {
     });
   }
 
-  // 13f) is_markdown and user_name are CARRIED, not dropped, but never as item
-  //      fields: the contract's item has neither, so both ride inside the
-  //      free-form custom_attributes. buildMemoryItems sets both on every
-  //      workspace memory chunk, and the rendering hint plus attribution still
-  //      arrive whichever layout the file lands on.
+  // 13f) The item is decoded strictly (hydradb-application#1653): user_name
+  //      is an item field on a text note and a conversation alike, a turn is
+  //      exactly {role, content}, and is_markdown (not an item field) rides in
+  //      the free-form custom_attributes.
   {
     assert.deepEqual(memoryToItem({ text: "# Title", is_markdown: true, user_name: "Ada" }), {
       text: "# Title",
+      user_name: "Ada",
       enrich: true,
-      custom_attributes: { is_markdown: true, user_name: "Ada" }
+      custom_attributes: { is_markdown: true }
     });
     assert.equal(
       memoryToItem({ text: "note", is_markdown: false }).custom_attributes.is_markdown,
@@ -1111,19 +1122,18 @@ export async function runHttpTests() {
       { plugin: "hydradb", is_markdown: true },
       "the caller's own custom_attributes are kept alongside"
     );
-    // A conversation's attribution rides on the per-turn speaker name instead.
     const conversationItem = memoryToItem({
       user_assistant_pairs: [{ user: "hi", assistant: "yo" }],
       user_name: "Ada"
     });
     assert.deepEqual(conversationItem.conversation, [
-      { role: "user", content: "hi", name: "Ada" },
+      { role: "user", content: "hi" },
       { role: "assistant", content: "yo" }
-    ]);
-    assert.ok(!("user_name" in conversationItem), "a conversation does not repeat it at item level");
-    assert.ok(!("custom_attributes" in conversationItem), "and does not repeat it in custom_attributes");
+    ], "no per-turn name: the strict decoder refuses it");
+    assert.equal(conversationItem.user_name, "Ada", "the speaker is the item's user_name");
+    assert.ok(!("custom_attributes" in conversationItem), "nothing extra rides in custom_attributes");
     for (const item of [memoryToItem({ text: "t", is_markdown: true, user_name: "Ada" }), conversationItem]) {
-      assert.ok(!("is_markdown" in item) && !("user_name" in item), "neither is ever an item field");
+      assert.ok(!("is_markdown" in item), "is_markdown is never an item field");
     }
   }
 

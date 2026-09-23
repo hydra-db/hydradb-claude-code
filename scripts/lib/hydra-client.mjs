@@ -1,9 +1,28 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+
 import { createHydraWrapper } from "./hydra/index.mjs";
 import { redactSecrets, stripControlChars, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_WRITE_TIMEOUT_MS = 15000;
+
+// PRO-2193: the layout probe runs before every recall and write, inside hooks
+// Claude Code kills at 20s. With the request timeout (15s) a slow probe plus
+// the call itself could overrun it; the probe gets its own short budget, and
+// its answer is kept on disk across hook processes for LAYOUT_CACHE_TTL_MS.
+export const LAYOUT_PROBE_TIMEOUT_MS = 3000;
+export const LAYOUT_CACHE_TTL_MS = 10 * 60_000;
+
+// PRO-2193: the unified ingest limits staging enforces (hydradb-application
+// #1653/#1657), in bytes of text. The request cap is held below the server's
+// 8 MiB so request-level fields and JSON escaping never tip it over.
+export const UNIFIED_MAX_ITEMS_PER_REQUEST = 100;
+export const UNIFIED_MAX_ITEM_TEXT_BYTES = 1 << 20;
+export const UNIFIED_MAX_REQUEST_TEXT_BYTES = 7 << 20;
+export const UNIFIED_MAX_TITLE_BYTES = 1024;
+export const UNIFIED_MAX_INSTRUCTIONS_CHARS = 4000;
 
 export const DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS =
   "Extract durable user preferences, working style, project decisions, recurring constraints, " +
@@ -333,13 +352,19 @@ function extractDetailedQueryPaths(response) {
 // `chunk_content`). The root key is `forceful_relations` only: a body that
 // still says `relations` is not the current contract and is not read as one.
 export function isUnifiedQueryResponse(response) {
-  return Boolean(
-    response &&
-      typeof response === "object" &&
-      Array.isArray(response.graph) &&
-      Array.isArray(response.forceful_relations) &&
-      typeof response.llm_prompt === "string"
-  );
+  if (!response || typeof response !== "object" || "graph_context" in response) {
+    return false;
+  }
+  if (!Array.isArray(response.graph) || typeof response.llm_prompt !== "string") {
+    return false;
+  }
+  // `forceful_relations` is optional in the contract: absent reads as none,
+  // present must be an array. The pre-rename `relations` in its place is not
+  // the current contract and is not read as one.
+  if ("forceful_relations" in response) {
+    return Array.isArray(response.forceful_relations);
+  }
+  return !("relations" in response);
 }
 
 // graph[].origin (CONTRACT): where a path came from. "query_path" is grown
@@ -566,12 +591,12 @@ export function isUnifiedLayoutRefusal(error) {
 // tenant_metadata), custom_attributes (was document_metadata). Exported so
 // the check script can pin the mapping.
 //
-// `is_markdown` and `user_name` are not item fields in the contract, so they
-// are not sent as ones. They are not dropped either: both ride inside the
-// free-form `custom_attributes`, so a synced file keeps its rendering hint and
-// a text note keeps its attribution whichever layout it lands on. A
-// conversation's attribution is the per-turn `name`, which IS in the contract
-// and is what the server reads first.
+// The item is decoded strictly (hydradb-application#1653): a turn is exactly
+// `{role, content}`, so the speaker goes on the item as `user_name`, for a
+// text note and a conversation alike. `is_markdown` is not an item field; it
+// rides in the free-form `custom_attributes` so a synced file keeps its
+// rendering hint. Title and instructions are clipped to the server's limits
+// rather than sent and refused.
 export function memoryToItem(memory) {
   const item = {};
   const conversation = Array.isArray(memory.user_assistant_pairs)
@@ -582,7 +607,7 @@ export function memoryToItem(memory) {
   }
   if (conversation) {
     item.conversation = conversation.flatMap((pair) => [
-      { role: "user", content: pair.user, ...(memory.user_name ? { name: memory.user_name } : {}) },
+      { role: "user", content: pair.user },
       { role: "assistant", content: pair.assistant }
     ]);
   }
@@ -590,11 +615,14 @@ export function memoryToItem(memory) {
     item.context_id = memory.source_id;
   }
   if (memory.title) {
-    item.title = memory.title;
+    item.title = clipUtf8(String(memory.title), UNIFIED_MAX_TITLE_BYTES);
+  }
+  if (memory.user_name) {
+    item.user_name = memory.user_name;
   }
   item.enrich = memory.infer ?? true;
   if (item.enrich && memory.custom_instructions) {
-    item.instructions = memory.custom_instructions;
+    item.instructions = [...String(memory.custom_instructions)].slice(0, UNIFIED_MAX_INSTRUCTIONS_CHARS).join("");
   }
   if (memory.tenant_metadata != null) {
     item.attributes = parseMaybeJson(memory.tenant_metadata);
@@ -603,13 +631,69 @@ export function memoryToItem(memory) {
   if (memory.is_markdown != null) {
     customAttributes.is_markdown = Boolean(memory.is_markdown);
   }
-  if (!conversation && memory.user_name) {
-    customAttributes.user_name = memory.user_name;
-  }
   if (Object.keys(customAttributes).length) {
     item.custom_attributes = customAttributes;
   }
   return item;
+}
+
+// Cut `text` to at most `maxBytes` of UTF-8 without splitting a character.
+export function clipUtf8(text, maxBytes) {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return text;
+  }
+  let out = "";
+  let bytes = 0;
+  for (const ch of text) {
+    const size = Buffer.byteLength(ch, "utf8");
+    if (bytes + size > maxBytes) {
+      break;
+    }
+    out += ch;
+    bytes += size;
+  }
+  return out;
+}
+
+// Bytes of text an item carries, the way the server counts its limits.
+export function itemTextBytes(item) {
+  let bytes = item?.text ? Buffer.byteLength(String(item.text), "utf8") : 0;
+  for (const turn of Array.isArray(item?.conversation) ? item.conversation : []) {
+    bytes += Buffer.byteLength(String(turn?.content ?? ""), "utf8");
+  }
+  return bytes;
+}
+
+// Split unified items into requests the server accepts: at most
+// UNIFIED_MAX_ITEMS_PER_REQUEST items and UNIFIED_MAX_REQUEST_TEXT_BYTES of
+// text each, in order. An item over the per-item limit is returned apart, so
+// the caller can refuse it by name instead of losing its whole request.
+export function planUnifiedRequests(items) {
+  const requests = [];
+  const oversized = [];
+  let current = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const bytes = itemTextBytes(item);
+    if (bytes > UNIFIED_MAX_ITEM_TEXT_BYTES) {
+      oversized.push(item);
+      continue;
+    }
+    if (
+      current.length &&
+      (current.length >= UNIFIED_MAX_ITEMS_PER_REQUEST || currentBytes + bytes > UNIFIED_MAX_REQUEST_TEXT_BYTES)
+    ) {
+      requests.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += bytes;
+  }
+  if (current.length) {
+    requests.push(current);
+  }
+  return { requests, oversized };
 }
 
 // A parsed metadata value as a fresh plain object, so keys can be added
@@ -647,7 +731,7 @@ export function appKnowledgeToItem(record) {
     item.context_id = record.id;
   }
   if (record?.title) {
-    item.title = record.title;
+    item.title = clipUtf8(String(record.title), UNIFIED_MAX_TITLE_BYTES);
   }
   const happenedAt = toHappenedAt(record?.timestamp);
   if (happenedAt) {
@@ -704,7 +788,9 @@ export function parseUnifiedIngestResponse(data) {
   const results = (Array.isArray(data?.results) ? data.results : [])
     .filter((entry) => entry && typeof entry === "object")
     .map((entry) => ({
-      contextId: entry.source_id == null ? "" : ingestResponseText(entry.source_id, 200),
+      // The server names the context `id` (V2MemoryResultItem); `source_id`
+      // is kept as a fallback for an older server.
+      contextId: (entry.id ?? entry.source_id) == null ? "" : ingestResponseText(entry.id ?? entry.source_id, 200),
       title: entry.title == null ? null : ingestResponseText(entry.title, 200),
       status: entry.status == null ? "" : ingestResponseText(entry.status, 40),
       enrich: Boolean(entry.infer),
@@ -738,7 +824,12 @@ export class HydraClient {
     // Test seams only (never set in production): inject a capturing fetch or a
     // spy SDK client so wire-level tests need no network. Forwarded verbatim.
     fetch: fetchImpl,
-    sdkClient
+    sdkClient,
+    // Where the layout answer is kept between hook processes (a small JSON
+    // file in the plugin's data dir), and a sink for debug events. Both
+    // optional: without them the probe runs once per process, as before.
+    layoutCacheFile,
+    onDebug
   } = {}) {
     // Kept as public fields: plugin code duck-types tenantId/subTenantId
     // (workspace-sync.mjs) and other call sites read them directly.
@@ -746,6 +837,14 @@ export class HydraClient {
     this.subTenantId = subTenantId;
     this.requestTimeoutMs = requestTimeoutMs;
     this.writeTimeoutMs = writeTimeoutMs;
+    this._layoutCacheFile = layoutCacheFile;
+    this._onDebug = typeof onDebug === "function" ? onDebug : null;
+    // The cache key names the server, the key (hashed, never stored) and the
+    // database, so two accounts that reuse a database name never share one.
+    this._layoutCacheKey = crypto
+      .createHash("sha256")
+      .update(`${baseUrl}\n${apiKey ?? ""}\n${tenantId ?? ""}`)
+      .digest("hex");
     // All wire I/O now flows through the canonical wrapper over the vendored SDK.
     this._hydra = createHydraWrapper({
       apiKey,
@@ -759,17 +858,109 @@ export class HydraClient {
     });
   }
 
-  // PRO-1618: whether the configured database keeps one corpus. Resolved once
-  // per process from GET /databases; a failed probe reads as split, so every
-  // existing configuration behaves exactly as before.
+  // PRO-1618: whether the configured database keeps one corpus. Anything but
+  // a known unified layout reads as split, so every existing configuration
+  // behaves exactly as before.
   async isUnified() {
-    if (!this._unifiedPromise) {
-      this._unifiedPromise = this._hydra.databases
-        .layout(this.tenantId)
-        .then((layout) => layout === "unified")
-        .catch(() => false);
+    return (await this.layoutState()) === "unified";
+  }
+
+  // "unified", "split", or "unknown" (the probe failed, or did not list the
+  // database). Resolved once per process: from the on-disk cache when it is
+  // fresh, else from GET /databases with a short timeout, so a hook never
+  // spends most of its 20s budget waiting on the probe. A failure is logged,
+  // not swallowed.
+  async layoutState() {
+    if (!this._layoutPromise) {
+      this._layoutPromise = (async () => {
+        const cached = await this._readLayoutCache();
+        if (cached) {
+          return cached;
+        }
+        try {
+          const layout = await this._hydra.databases.knownLayout(this.tenantId, {
+            timeoutMs: LAYOUT_PROBE_TIMEOUT_MS
+          });
+          if (layout) {
+            await this._writeLayoutCache(layout);
+            return layout;
+          }
+          await this._debug("layout-probe", { outcome: "database not listed" });
+        } catch (error) {
+          await this._debug("layout-probe", { outcome: "failed", error: String(error?.message ?? error) });
+        }
+        return "unknown";
+      })();
     }
-    return this._unifiedPromise;
+    return this._layoutPromise;
+  }
+
+  // For background work (workspace sync has 120s, not a prompt's 20s): when
+  // the short probe could not answer, ask once more with the full request
+  // timeout before deciding how to cut files, so a slow probe does not leave
+  // a unified database synced with split-sized pieces the server refuses.
+  async resolveLayoutPatiently() {
+    const first = await this.layoutState();
+    if (first !== "unknown") {
+      return first;
+    }
+    try {
+      const layout = await this._hydra.databases.knownLayout(this.tenantId, { timeoutMs: this.requestTimeoutMs });
+      if (layout) {
+        this._layoutPromise = Promise.resolve(layout);
+        await this._writeLayoutCache(layout);
+        return layout;
+      }
+    } catch (error) {
+      await this._debug("layout-probe", { outcome: "failed (patient)", error: String(error?.message ?? error) });
+    }
+    return "unknown";
+  }
+
+  async _readLayoutCache() {
+    if (!this._layoutCacheFile) {
+      return null;
+    }
+    try {
+      const entry = JSON.parse(await fs.readFile(this._layoutCacheFile, "utf8"))?.[this._layoutCacheKey];
+      const fresh = entry && Date.now() - Number(entry.at) <= LAYOUT_CACHE_TTL_MS;
+      return fresh && (entry.layout === "unified" || entry.layout === "split") ? entry.layout : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _writeLayoutCache(layout) {
+    if (!this._layoutCacheFile) {
+      return;
+    }
+    try {
+      let all = {};
+      try {
+        all = JSON.parse(await fs.readFile(this._layoutCacheFile, "utf8")) || {};
+      } catch {
+        all = {};
+      }
+      all[this._layoutCacheKey] = { layout, at: Date.now() };
+      // Written to a temp file and renamed into place (as state.json is), so a
+      // concurrent hook never reads half-written JSON. Two writers racing can
+      // still drop each other's key; that only costs a later probe.
+      const tempPath = `${this._layoutCacheFile}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(all), { mode: 0o600 });
+      await fs.rename(tempPath, this._layoutCacheFile);
+    } catch {
+      // The cache is an optimisation: a write that fails costs one probe later.
+    }
+  }
+
+  async _debug(event, payload) {
+    if (this._onDebug) {
+      try {
+        await this._onDebug(event, payload);
+      } catch {
+        // Debug output never breaks a hook.
+      }
+    }
   }
 
   // The server names the rule when a split kind reaches a unified database.
@@ -779,10 +970,15 @@ export class HydraClient {
   // meant a retry that failed for an unrelated reason (a timeout, a 500) left
   // the process sending unified for its whole lifetime against a database that
   // may well be split.
+  //
+  // Only when the layout is UNKNOWN: on a database known to be split the
+  // refusal is not about the layout, and a unified retry would send the
+  // request somewhere the caller did not ask.
   async _retryAsUnified(error, retry) {
-    if (isUnifiedLayoutRefusal(error) && !(await this.isUnified())) {
+    if (isUnifiedLayoutRefusal(error) && (await this.layoutState()) === "unknown") {
       const result = await retry();
-      this._unifiedPromise = Promise.resolve(true);
+      this._layoutPromise = Promise.resolve("unified");
+      await this._writeLayoutCache("unified");
       return result;
     }
     throw error;
@@ -810,13 +1006,20 @@ export class HydraClient {
       },
       { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
     );
-    if (!isUnifiedQueryResponse(data)) {
-      throw new Error(
-        "/query on a unified database did not answer with the unified body " +
-          "(chunks[], graph[], forceful_relations[], llm_prompt)"
-      );
+    if (isUnifiedQueryResponse(data)) {
+      return normalizeUnifiedResponse(data);
     }
-    return normalizeUnifiedResponse(data);
+    // Read by SHAPE, not by what was asked: a unified database answers in v2
+    // while the server's unified surface is off, and a server that predates
+    // the unified response does too. That answer is readable; only a body
+    // that is neither shape is refused.
+    if (data && typeof data === "object" && Array.isArray(data.chunks) && !("llm_prompt" in data)) {
+      return normalizeRetrievalResponse(data);
+    }
+    throw new Error(
+      "/query on a unified database answered with neither the unified body " +
+        "(chunks[], graph[], llm_prompt) nor the v2 body"
+    );
   }
 
   // One unified write (CONTRACT: POST /context/ingest as a JSON body whose
@@ -830,17 +1033,46 @@ export class HydraClient {
   // refused item that came back as a return value would be lost for good.
   // It is raised instead, the way a split database's 4xx is, with the context
   // ids and reasons in the message and the parsed 202 attached as `ingest`.
+  //
+  // The server caps a request at 100 items and 8 MiB of text, and an item at
+  // 1 MiB; one request over either is refused whole. So the items go out as
+  // as many requests as those caps need, in order, and an item over the
+  // per-item cap is not sent: it is reported by name as refused, and the rest
+  // still go.
   async addItems(items, options = {}) {
-    const data = await this._hydra.context.ingest(
-      {
-        context: items,
-        upsert: options.upsert ?? true,
-        ...(options.enrich != null ? { enrich: options.enrich } : {}),
-        ...(options.instructions != null ? { instructions: options.instructions } : {})
-      },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
-    const parsed = parseUnifiedIngestResponse(data);
+    const { requests, oversized } = planUnifiedRequests(items);
+    const parts = [];
+    for (const batch of requests) {
+      const data = await this._hydra.context.ingest(
+        {
+          context: batch,
+          upsert: options.upsert ?? true,
+          ...(options.enrich != null ? { enrich: options.enrich } : {}),
+          ...(options.instructions != null ? { instructions: options.instructions } : {})
+        },
+        { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+      );
+      parts.push(parseUnifiedIngestResponse(data));
+    }
+    const tooLarge = oversized.map((item) => ({
+      contextId: item.context_id ? ingestResponseText(item.context_id, 200) : "",
+      title: item.title ? ingestResponseText(item.title, 200) : null,
+      status: "failed",
+      enrich: Boolean(item.enrich),
+      error: `text is ${itemTextBytes(item)} bytes; the maximum per item is ${UNIFIED_MAX_ITEM_TEXT_BYTES}`,
+      errorCode: "ITEM_TOO_LARGE"
+    }));
+    const results = [...parts.flatMap((p) => p.results), ...tooLarge];
+    const parsed = {
+      success: parts.every((p) => p.success) && !tooLarge.length,
+      message: parts.map((p) => p.message).filter(Boolean).join(" "),
+      successCount: parts.reduce((n, p) => n + p.successCount, 0),
+      failedCount: parts.reduce((n, p) => n + p.failedCount, 0) + tooLarge.length,
+      contextIds: parts.flatMap((p) => p.contextIds),
+      failed: [...parts.flatMap((p) => p.failed), ...tooLarge],
+      results,
+      raw: parts.length === 1 && !tooLarge.length ? parts[0].raw : parts.map((p) => p.raw)
+    };
     if (parsed.failed.length || parsed.failedCount > 0 || !parsed.success) {
       const refused = parsed.failed.length || parsed.failedCount;
       const reasons = parsed.failed.map(

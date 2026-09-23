@@ -522,6 +522,14 @@ export function createHydraWrapper({
         return "split";
       }
     },
+    // The layout only when it is KNOWN (the probe answered and listed the
+    // database); undefined otherwise. Unlike layout(), a failed probe is not
+    // read as split: a caller about to retry a refused request as unified
+    // needs to tell "known split" from "could not tell". A probe failure is
+    // re-thrown so the caller can log it.
+    async knownLayout(database, opts = {}) {
+      return (await databases.layouts(opts)).get(database);
+    },
     async collections(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       return unwrapAndNormalize(

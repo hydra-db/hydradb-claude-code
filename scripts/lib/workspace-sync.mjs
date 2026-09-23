@@ -345,15 +345,36 @@ async function gatherFiles(projectRoot) {
   return relPaths.map((relPath) => path.join(projectRoot, relPath));
 }
 
+// PRO-2193: the largest file piece sent to a unified database. The server
+// refuses an item over 1 MiB of text (and with it the whole request); 250k
+// characters stays under that even when every character is four UTF-8 bytes.
+export const UNIFIED_MAX_CHUNK_CHARS = 250_000;
+
 export async function syncWorkspace({
   client,
-  config,
+  config: baseConfig,
   projectRoot,
   workspaceName,
   state,
   candidatePaths = null,
   force = false
 }) {
+  // On a unified database, files are cut to pieces the server accepts, and a
+  // file too large to go whole takes the chunked (memory-shaped) path. Both
+  // lanes land in the same one corpus there. A split database keeps its
+  // configured sizes exactly.
+  // Sync runs in the background (120s), so a probe that timed out is asked
+  // again patiently before files are cut: a unified database must never be
+  // synced with split-sized pieces the server refuses.
+  const unified =
+    typeof client?.resolveLayoutPatiently === "function"
+      ? (await client.resolveLayoutPatiently()) === "unified"
+      : typeof client?.isUnified === "function"
+        ? await client.isUnified()
+        : false;
+  const config = unified
+    ? { ...baseConfig, maxMemoryCharsPerChunk: Math.min(baseConfig.maxMemoryCharsPerChunk, UNIFIED_MAX_CHUNK_CHARS) }
+    : baseConfig;
   const filesToCheck = candidatePaths ?? (await gatherFiles(projectRoot));
   const summary = {
     scanned: 0,
@@ -398,7 +419,10 @@ export async function syncWorkspace({
       }
 
       const chunkCount = splitIntoChunks(details.content, config.maxMemoryCharsPerChunk).length;
-      const target = chooseIngestionTarget(config, chunkCount);
+      let target = chooseIngestionTarget(config, chunkCount);
+      if (unified && target === "knowledge" && details.content.length > config.maxMemoryCharsPerChunk) {
+        target = "memory";
+      }
 
       staged.push({
         ...details,
@@ -424,19 +448,43 @@ export async function syncWorkspace({
   const memoryFiles = staged.filter((file) => file.target === "memory");
   const knowledgeFiles = staged.filter((file) => file.target === "knowledge");
 
-  const memoryItems = memoryFiles.flatMap((file) => buildMemoryItems(file, projectRoot, config));
+  // A batch that fails is reported and its files are left unsynced (so the
+  // next sync retries exactly them); the other batches still go. One refused
+  // file used to abort the whole sync with nothing recorded.
+  const failedPaths = new Set();
+  const fileOfSourceId = new Map();
+  const memoryItems = memoryFiles.flatMap((file) => {
+    const items = buildMemoryItems(file, projectRoot, config);
+    for (const item of items) {
+      fileOfSourceId.set(item.source_id, file.filePath);
+    }
+    return items;
+  });
   for (const batch of batchMemoryItems(memoryItems, config.maxFileSizeBytes)) {
-    await client.addMemories(batch, {
-      upsert: true,
-      timeoutMs: config.writeTimeoutMs
-    });
+    try {
+      await client.addMemories(batch, {
+        upsert: true,
+        timeoutMs: config.writeTimeoutMs
+      });
+    } catch (error) {
+      summary.errors.push(`memory ingest failed: ${error.message}`);
+      for (const item of batch) {
+        failedPaths.add(fileOfSourceId.get(item.source_id));
+      }
+    }
   }
 
   for (let index = 0; index < knowledgeFiles.length; index += 5) {
-    const batch = knowledgeFiles.slice(index, index + 5).map((file) =>
-      buildKnowledgeItem(file, projectRoot, workspaceName)
-    );
-    await client.uploadKnowledge(batch);
+    const files = knowledgeFiles.slice(index, index + 5);
+    const batch = files.map((file) => buildKnowledgeItem(file, projectRoot, workspaceName));
+    try {
+      await client.uploadKnowledge(batch);
+    } catch (error) {
+      summary.errors.push(`knowledge ingest failed: ${error.message}`);
+      for (const file of files) {
+        failedPaths.add(file.filePath);
+      }
+    }
   }
 
   if (candidatePaths == null) {
@@ -446,6 +494,11 @@ export async function syncWorkspace({
     const deletedKnowledgePaths = [];
 
     for (const [filePath, previous] of Object.entries(state.files || {})) {
+      // A file whose new version failed to upload keeps its old context until
+      // the retry succeeds; deleting its stale ids now would leave nothing.
+      if (failedPaths.has(filePath)) {
+        continue;
+      }
       const wasDeleted = !scannedPaths.has(filePath);
       const ineligible = ineligibleByPath.get(filePath);
       const stagedEntry = stagedByPath.get(filePath);
@@ -567,6 +620,10 @@ export async function syncWorkspace({
   }
 
   for (const file of staged) {
+    if (failedPaths.has(file.filePath)) {
+      summary.failedFiles = [...(summary.failedFiles || []), { path: file.relPath, target: file.target }];
+      continue;
+    }
     state.files[file.filePath] = {
       digest: file.digest,
       relPath: file.relPath,
