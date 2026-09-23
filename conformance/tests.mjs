@@ -11,19 +11,25 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { buildHydraContextBlock, buildUnifiedStructuredString } from "../scripts/lib/context-format.mjs";
+import {
+  buildHydraContextBlock,
+  buildUnifiedStructuredString,
+  UNIFIED_FORCEFUL_RELATIONS_GUIDE,
+  UNIFIED_FORCEFUL_RELATIONS_HEADING
+} from "../scripts/lib/context-format.mjs";
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import {
   appKnowledgeToItem,
   EMPTY_UNIFIED_RECALL,
   HydraClient,
   isUnifiedLayoutRefusal,
+  isUnifiedQueryResponse,
   memoryToItem,
   normalizeRetrievalResponse,
   parseUnifiedIngestResponse
 } from "../scripts/lib/hydra-client.mjs";
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
-import { SPLIT_QUERY_RESPONSE, UNIFIED_QUERY_RESPONSE } from "./fixtures.mjs";
+import { SPLIT_QUERY_RESPONSE, UNIFIED_QUERY_META, UNIFIED_QUERY_RESPONSE } from "./fixtures.mjs";
 
 function fakeResponse(payload) {
   // A responder may name the HTTP status through `__status` (default 200),
@@ -348,12 +354,14 @@ export async function runHttpTests() {
   // 10) PRO-1618: unified recall is a hand-built POST /query with NO `type`
   //     (CONTRACT: absent is the unified default; knowledge/memory are 400),
   //     carrying follow_forceful_relations, and the four-key body it answers
-  //     with is parsed by shape into chunks/graph/relations/llmPrompt.
+  //     with is parsed by shape into chunks/graph/forcefulRelations/llmPrompt.
+  //     The envelope carries the unified meta, which has no tenant_id,
+  //     sub_tenant_id or source_type, and none of those reach the result.
   {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
-      fetch: capturingFetch(sink, () => ({ data: UNIFIED_QUERY_RESPONSE, success: true }))
+      fetch: capturingFetch(sink, () => ({ data: UNIFIED_QUERY_RESPONSE, success: true, meta: UNIFIED_QUERY_META }))
     });
     const res = await client.recallUnified("acme", { followForcefulRelations: true });
     const req = sink.at(-1);
@@ -386,18 +394,80 @@ export async function runHttpTests() {
       }
     ]);
     assert.ok(!("enrichment" in res.chunks[1]), "enrichment is absent when the server sent none");
-    assert.equal(res.graph.length, 1);
+    assert.equal(res.graph.length, 2);
+    assert.equal(res.graph[0].origin, "query_path");
     assert.equal(res.graph[0].pathSummary, "John is on the Pro plan since June 2026.");
     assert.equal(res.graph[0].triplets[0].relation.canonical_predicate, "subscribed to");
-    assert.deepEqual(res.relations[0].via, { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" });
-    assert.equal(res.relations[0].chunk.contextId, "linear-PRO-1169-comment-4");
-    assert.equal(res.relations[0].chunk.content, "Comment 4: shipped the fix in #1625.");
-    for (const key of ["chunk_content", "graph_context", "sources", "additional_context"]) {
-      assert.ok(!(key in res), `no split-era key ${key} on a unified result`);
+    assert.equal(res.graph[1].origin, "chunk_relation");
+    assert.equal(res.graph[1].pathSummary, "The refund policy allows refunds within 30 days.");
+    assert.equal(res.forcefulRelations.length, 1);
+    assert.deepEqual(res.forcefulRelations[0].via, { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" });
+    assert.equal(res.forcefulRelations[0].chunk.contextId, "linear-PRO-1169-comment-4");
+    assert.equal(res.forcefulRelations[0].chunk.content, "Comment 4: shipped the fix in #1625.");
+    assert.deepEqual(Object.keys(res).sort(), ["chunks", "forcefulRelations", "graph", "layout", "llmPrompt"]);
+    for (const key of ["chunk_content", "graph_context", "sources", "additional_context", "relations"]) {
+      assert.ok(!(key in res), `no split-era or superseded key ${key} on a unified result`);
+    }
+    const serialized = JSON.stringify(res);
+    for (const key of ["tenant_id", "sub_tenant_id", "source_type", "tenantId", "subTenantId", "sourceType"]) {
+      assert.ok(!serialized.includes(key), `the unified result carries no ${key}`);
     }
   }
 
-  // 10b) The shape decides, not a flag: the SAME normalizer given the v2 shape
+  // 10a) graph[].origin is one of the two values the contract defines; a path
+  //      without one (or with any other value) keeps its summary and triplets
+  //      and simply has no origin.
+  {
+    const res = normalizeRetrievalResponse({
+      ...UNIFIED_QUERY_RESPONSE,
+      graph: [
+        { path_summary: "no origin" },
+        { origin: "something_else", path_summary: "unknown origin" }
+      ]
+    });
+    assert.deepEqual(
+      res.graph.map((path) => [path.origin, path.pathSummary]),
+      [
+        [undefined, "no origin"],
+        [undefined, "unknown origin"]
+      ]
+    );
+    assert.ok(!("origin" in res.graph[0]) && !("origin" in res.graph[1]), "origin is absent, not null");
+  }
+
+  // 10b) The forceful-relations root key is `forceful_relations` and nothing
+  //      else. A body that still says `relations` is not the unified shape
+  //      (no fallback to the old key), and recallUnified refuses it with a
+  //      named error instead of handing readers a result without the bucket.
+  {
+    const { forceful_relations: bucket, ...withoutBucket } = UNIFIED_QUERY_RESPONSE;
+    const oldKeyBody = { ...withoutBucket, relations: bucket };
+    assert.equal(isUnifiedQueryResponse(UNIFIED_QUERY_RESPONSE), true);
+    assert.equal(isUnifiedQueryResponse(oldKeyBody), false, "`relations` is not read as forceful_relations");
+    assert.equal(isUnifiedQueryResponse(withoutBucket), false, "forceful_relations[] is required");
+    assert.equal(
+      isUnifiedQueryResponse({ ...UNIFIED_QUERY_RESPONSE, forceful_relations: {} }),
+      false,
+      "forceful_relations must be an array"
+    );
+    assert.equal(
+      isUnifiedQueryResponse({ ...UNIFIED_QUERY_RESPONSE, forceful_relations: [] }),
+      true,
+      "an empty forceful_relations[] is still the unified shape"
+    );
+
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch([], () => ({ data: oldKeyBody, success: true, meta: UNIFIED_QUERY_META }))
+    });
+    await assert.rejects(
+      () => client.recallUnified("acme"),
+      /did not answer with the unified body \(chunks\[\], graph\[\], forceful_relations\[\], llm_prompt\)/,
+      "a body with the old key is refused, not read"
+    );
+  }
+
+  // 10c) The shape decides, not a flag: the SAME normalizer given the v2 shape
   //      takes the legacy path (chunk_content, graph_context), so a split
   //      database and a stored log keep reading exactly as before.
   {
@@ -406,10 +476,14 @@ export async function runHttpTests() {
     assert.equal(split.chunks[0].text, "workspace overview: build with make smoke");
     assert.equal(split.chunks[0].sourceTitle, "README.md");
     const unifiedNoChunks = normalizeRetrievalResponse({ ...UNIFIED_QUERY_RESPONSE, chunks: [] });
-    assert.equal(unifiedNoChunks.layout, "unified", "graph[] plus llm_prompt is the unified shape even with no chunks");
+    assert.equal(
+      unifiedNoChunks.layout,
+      "unified",
+      "graph[] and forceful_relations[] plus llm_prompt is the unified shape even with no chunks"
+    );
   }
 
-  // 10c) What the model sees on a unified database is the llm_prompt verbatim,
+  // 10d) What the model sees on a unified database is the llm_prompt verbatim,
   //      citation labels included, and none of the MEMORY/KNOWLEDGE template.
   {
     const unified = normalizeRetrievalResponse(UNIFIED_QUERY_RESPONSE);
@@ -424,9 +498,14 @@ export async function runHttpTests() {
     });
     assert.ok(block.startsWith("<hydradb-context>\n"));
     assert.ok(block.includes(`\n${UNIFIED_QUERY_RESPONSE.llm_prompt}\n`), "llm_prompt is injected verbatim");
-    for (const label of ["[1]", "[2]", "[R1]", "[P1]"]) {
+    for (const label of ["[1]", "[2]", "[R1]", "[P1]", "[P2]"]) {
       assert.ok(block.includes(label), `citation label ${label} survives`);
     }
+    assert.ok(
+      block.includes(`=== FORCEFUL RELATIONS ===\n${UNIFIED_FORCEFUL_RELATIONS_GUIDE}\n`),
+      "the forceful-relations heading and its guide line reach the model as the server wrote them"
+    );
+    assert.ok(!block.includes("=== RELATED CONTEXT ==="), "the superseded heading is gone");
     assert.ok(!/=== (MEMORY|KNOWLEDGE) /.test(block), "no split-era section headers");
     assert.ok(!/Chunk 1\nSource:/.test(block), "the chunk template is not rebuilt around the prompt");
     assert.equal(
@@ -444,8 +523,21 @@ export async function runHttpTests() {
       structured.includes("Temporal: Refund window was 14 days. Start: 2025-01-01, End: 2026-06-30"),
       "a temporal fact is rendered with the chunk it dates"
     );
-    assert.ok(structured.includes("[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)"));
+    assert.equal(UNIFIED_FORCEFUL_RELATIONS_HEADING, "=== FORCEFUL RELATIONS ===");
+    assert.ok(
+      structured.includes(
+        [
+          "=== FORCEFUL RELATIONS ===",
+          "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.",
+          "",
+          "[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)"
+        ].join("\n")
+      ),
+      "the structured form uses the server's heading and guide line"
+    );
+    assert.ok(!structured.includes("RELATED CONTEXT"), "the superseded heading is gone");
     assert.ok(structured.includes("[P1] John is on the Pro plan since June 2026."));
+    assert.ok(structured.includes("[P2] The refund policy allows refunds within 30 days."));
   }
 
   // 11) Unified delete is a hand-built DELETE /context with NO `type`
@@ -981,7 +1073,7 @@ export async function runHttpTests() {
     assert.deepEqual(JSON.parse(sink.at(-1).bodyString), { database: "new_db", type: "unified" });
   }
 
-  return { tests: 25 };
+  return { tests: 27 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

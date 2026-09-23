@@ -52,9 +52,10 @@ export const SPLIT_QUERY_RESPONSE = {
 };
 
 // The four-key body a UNIFIED database returns (CONTRACT.md, POST /query):
-// chunks, graph, relations, llm_prompt and nothing else. Field names are the
-// contract's exactly. The llm_prompt carries the citation labels [1], [R1],
-// [P1] that the plugin must surface verbatim.
+// chunks, graph, forceful_relations, llm_prompt and nothing else. Field names
+// are the contract's exactly. graph[] carries one path of each origin, and the
+// llm_prompt carries the citation labels [1], [R1], [P1] that the plugin must
+// surface verbatim.
 export const UNIFIED_QUERY_RESPONSE = {
   chunks: [
     {
@@ -80,6 +81,7 @@ export const UNIFIED_QUERY_RESPONSE = {
   ],
   graph: [
     {
+      origin: "query_path",
       triplets: [
         {
           source: { entity_id: "ent_a3f", name: "John" },
@@ -94,9 +96,25 @@ export const UNIFIED_QUERY_RESPONSE = {
         }
       ],
       path_summary: "John is on the Pro plan since June 2026."
+    },
+    {
+      origin: "chunk_relation",
+      triplets: [
+        {
+          source: { entity_id: "ent_rp1", name: "Refund policy" },
+          relation: {
+            predicate: "allows refunds within",
+            context: "Refund policy: 30-day window.",
+            relationship_id: "rel_2",
+            chunk_id: "ck_1a0"
+          },
+          target: { entity_id: "ent_30d", name: "30 days" }
+        }
+      ],
+      path_summary: "The refund policy allows refunds within 30 days."
     }
   ],
-  relations: [
+  forceful_relations: [
     {
       via: { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" },
       chunk: {
@@ -119,12 +137,27 @@ export const UNIFIED_QUERY_RESPONSE = {
     "[2] context_id: policy-1",
     "Refund policy: 30-day window.",
     "",
-    "=== RELATED CONTEXT ===",
+    "=== FORCEFUL RELATIONS ===",
+    "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.",
+    "",
     "[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)",
     "Comment 4: shipped the fix in #1625.",
     "",
     "=== GRAPH ===",
     "[P1] John is on the Pro plan since June 2026.",
-    "    John -> subscribed to -> Pro plan [1]"
+    "    John -> subscribed to -> Pro plan [1]",
+    "[P2] The refund policy allows refunds within 30 days.",
+    "    Refund policy -> allows refunds within -> 30 days [2]"
   ].join("\n")
+};
+
+// The envelope `meta` of a unified /query (CONTRACT): request_id, api_version,
+// latency_ms, database, collection. A unified meta has NO tenant_id,
+// sub_tenant_id or source_type, and nothing on the unified path reads them.
+export const UNIFIED_QUERY_META = {
+  request_id: "req_7c1",
+  api_version: "2",
+  latency_ms: 42,
+  database: "db_test",
+  collection: "col_test"
 };

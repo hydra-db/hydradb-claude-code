@@ -438,8 +438,8 @@ export async function loadConfig(cwd, dataDir) {
     recallMode: merged.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: parseBoolean(merged.graphContext, DEFAULTS.graphContext, errors, "graphContext"),
     // PRO-1618: whether a unified recall follows the forceful relations the
-    // caller declared at ingest (the relations[] bucket of the response). Sent
-    // only to a unified database; a split one has no such field.
+    // caller declared at ingest (the forceful_relations[] bucket of the
+    // response). Sent only to a unified database; a split one has no such field.
     followForcefulRelations: parseBoolean(
       merged.followForcefulRelations,
       DEFAULTS.followForcefulRelations,

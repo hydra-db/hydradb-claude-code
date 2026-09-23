@@ -102,7 +102,7 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `ingestionMode` | `memory` | `memory`, `knowledge`, or `auto` |
 | `recallMode` | `thinking` | Recall strategy passed to HydraDB |
 | `graphContext` | `true` | Include graph entity paths and relations in recall |
-| `followForcefulRelations` | `true` | Unified databases only: follow the forceful relations declared at ingest, so recall returns the related context (`relations[]`, the `[R1]` entries of `llm_prompt`) |
+| `followForcefulRelations` | `true` | Unified databases only: follow the forceful relations declared at ingest, so recall returns the linked context (`forceful_relations[]`, the `[R1]` entries of `llm_prompt`) |
 | `maxContextChars` | `7000` | Max characters injected into Claude's context per prompt |
 | `maxMemoryResults` | `6` | Max memory chunks returned per recall |
 | `maxKnowledgeResults` | `4` | Max knowledge chunks returned per recall |

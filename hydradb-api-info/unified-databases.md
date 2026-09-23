@@ -74,27 +74,30 @@ The response `data` has exactly four keys:
       "temporal": [ { "content": "...", "start_date": "2026-06-01", "end_date": null } ] }
   ],
   "graph": [
-    { "triplets": [ { "source": { "entity_id": "ent_a3f", "name": "John" },
+    { "origin": "query_path",
+      "triplets": [ { "source": { "entity_id": "ent_a3f", "name": "John" },
                       "relation": { "predicate": "subscribed to", "context": "John subscribed to the Pro plan.",
                                     "temporal_details": "since June", "relationship_id": "rel_1", "chunk_id": "ck_9f2" },
                       "target": { "entity_id": "ent_9c1", "name": "Pro plan" } } ],
       "path_summary": "John is on the Pro plan since June 2026." }
   ],
-  "relations": [
+  "forceful_relations": [
     { "via": { "from": "linear-PRO-1169", "to": "linear-PRO-1169-comment-4" },
       "chunk": { "chunk_id": "ck_7b3", "context_id": "linear-PRO-1169-comment-4", "score": 0.42, "content": "..." } }
   ],
-  "llm_prompt": "=== CONTEXT ===\nCite anything you use from this context with its bracketed label, e.g. [1].\n\n[1] context_id: chat-2026-07-29#w2\n...\n=== RELATED CONTEXT ===\n[R1] ...\n=== GRAPH ===\n[P1] John is on the Pro plan since June 2026.\n    John -> subscribed to -> Pro plan [1]"
+  "llm_prompt": "=== CONTEXT ===\nCite anything you use from this context with its bracketed label, e.g. [1].\n\n[1] context_id: chat-2026-07-29#w2\n...\n=== FORCEFUL RELATIONS ===\nLinked to a result by the author at ingest time (forceful_relations), not by relevance to this query.\n\n[R1] ...\n=== GRAPH ===\n[P1] John is on the Pro plan since June 2026.\n    John -> subscribed to -> Pro plan [1]"
 }
 ```
 
 What the plugin does with it:
 
 - The `<hydradb-context>` block injected on each prompt contains `llm_prompt` verbatim (secret redaction and the `maxContextChars` budget still apply). It carries the citation labels `[1]`, `[R1]`, `[P1]` the model is asked to cite, so the plugin never rebuilds it from the chunks.
-- `query --json` returns `searchMode: "unified"` and a `unified` object: `chunks[]` (`contextId`, `chunkId`, `score`, `content`, `enrichment{text,kind}`, `temporal[]`), `graph[]` (`pathSummary`, `triplets`), `relations[]` (`via{from,to}`, `chunk`) and `llmPrompt`. The text output renders the structured fields in the same `[n]` / `[Rn]` / `[Pn]` labelling.
-- `/hydradb:last-recall` reports `unifiedCount`, `unifiedGraphPathCount` and `unifiedRelationCount` for a unified recall.
+- `query --json` returns `searchMode: "unified"` and a `unified` object: `chunks[]` (`contextId`, `chunkId`, `score`, `content`, `enrichment{text,kind}`, `temporal[]`), `graph[]` (`origin`, `pathSummary`, `triplets`), `forcefulRelations[]` (`via{from,to}`, `chunk`) and `llmPrompt`. The text output renders the structured fields in the same `[n]` / `[Rn]` / `[Pn]` labelling and the same `=== FORCEFUL RELATIONS ===` heading and guide line as `llm_prompt`.
+- `/hydradb:last-recall` reports `unifiedCount`, `unifiedGraphPathCount` and `unifiedForcefulRelationCount` for a unified recall.
 - Chunks carry nothing about their source (no title, url, collection or timestamps). Use `GET /context/inspect?database=..&id=<context_id>` for that.
-- The parser tells the two shapes apart by shape (`graph` is an array and `llm_prompt` a string, versus `graph_context` and `chunk_content`), never by a flag, because split databases and stored logs keep producing the old shape.
+- The parser tells the two shapes apart by shape (`graph` and `forceful_relations` are arrays and `llm_prompt` a string, versus `graph_context` and `chunk_content`), never by a flag, because split databases and stored logs keep producing the old shape. The bucket is read from `forceful_relations` only: a body that names it `relations` is refused as not the unified body, never read as one.
+- `graph[].origin` is `"query_path"` (a path grown from the query's entities) or `"chunk_relation"` (the neighbourhood of a returned chunk); `query --json` carries it as `unified.graph[].origin`, and leaves it off a path whose origin is missing or not one of those two.
+- The envelope `meta` of a unified response carries `request_id`, `api_version`, `latency_ms`, `database` and `collection`, and no `tenant_id`, `sub_tenant_id` or `source_type`. The plugin reads no field of `meta` on a unified database.
 
 ## Other endpoints
 

@@ -142,7 +142,7 @@ If you use `ingestionMode: "auto"`, pair it with `searchMode: "both"` so auto re
 
 ### `followForcefulRelations`
 
-Unified databases only (default `true`): whether recall follows the forceful relations declared at ingest, so the response's `relations[]` and the `[R1]` entries of `llm_prompt` are filled. A split database has no such field and is never sent it.
+Unified databases only (default `true`): whether recall follows the forceful relations declared at ingest, so the response's `forceful_relations[]` and the `[R1]` entries of `llm_prompt` (its `=== FORCEFUL RELATIONS ===` section) are filled. A split database has no such field and is never sent it.
 
 ## 4. Network timeout controls
 
@@ -229,7 +229,7 @@ On each user prompt, the plugin can inject a bounded `<hydradb-context>` block c
 - chunk-level graph relations
 - extra linked context when HydraDB returns it
 
-On a unified database the block is instead the server-built `llm_prompt` from the four-key query response, injected verbatim (secret redaction and the `maxContextChars` budget still apply). It already carries context, related context and graph paths with citation labels (`[1]`, `[R1]`, `[P1]`), so nothing is rebuilt from the chunks.
+On a unified database the block is instead the server-built `llm_prompt` from the four-key query response, injected verbatim (secret redaction and the `maxContextChars` budget still apply). It already carries context, forceful relations and graph paths with citation labels (`[1]`, `[R1]`, `[P1]`), so nothing is rebuilt from the chunks.
 
 This content is explicitly framed as reference material, not as new instructions.
 

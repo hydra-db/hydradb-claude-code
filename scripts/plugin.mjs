@@ -514,14 +514,14 @@ async function handleUserPromptSubmit() {
       recall.memory.graphContext?.queryPathsDetailed?.length || recall.memory.queryPaths.length,
     knowledgeGraphPathCount:
       recall.knowledge.graphContext?.queryPathsDetailed?.length || recall.knowledge.queryPaths.length,
-    // PRO-1618: a unified recall is one list plus graph paths and relations.
-    // The keys exist only when the recall was unified, so the split payload
-    // keeps its exact shape.
+    // PRO-1618: a unified recall is one list plus graph paths and forceful
+    // relations. The keys exist only when the recall was unified, so the split
+    // payload keeps its exact shape.
     ...(recall.searchMode === "unified"
       ? {
           unifiedCount: recall.unified.chunks.length,
           unifiedGraphPathCount: recall.unified.graph.length,
-          unifiedRelationCount: recall.unified.relations.length
+          unifiedForcefulRelationCount: recall.unified.forcefulRelations.length
         }
       : {}),
     errors: recall.errors,
@@ -724,7 +724,7 @@ function formatLastRecallText(lastRecall) {
   if (lastRecall.unifiedCount != null) {
     lines.push(`unifiedCount: ${lastRecall.unifiedCount}`);
     lines.push(`unifiedGraphPathCount: ${lastRecall.unifiedGraphPathCount ?? 0}`);
-    lines.push(`unifiedRelationCount: ${lastRecall.unifiedRelationCount ?? 0}`);
+    lines.push(`unifiedForcefulRelationCount: ${lastRecall.unifiedForcefulRelationCount ?? 0}`);
   }
   lines.push(`memoryCount: ${lastRecall.memoryCount ?? 0}`);
   lines.push(`knowledgeCount: ${lastRecall.knowledgeCount ?? 0}`);
@@ -852,7 +852,7 @@ function renderRecallText(result) {
 
   if (result.searchMode === "unified") {
     // The structured view of the four-key body: chunks with their
-    // context_id/score/content/enrichment, related context, graph path
+    // context_id/score/content/enrichment, forceful relations, graph path
     // summaries. The --json payload carries llmPrompt for the model.
     const structured = buildUnifiedStructuredString(result.unified);
     lines.push(structured || "Context:\n- none");

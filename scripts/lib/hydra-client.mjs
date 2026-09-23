@@ -317,23 +317,32 @@ function extractDetailedQueryPaths(response) {
 
 // CONTRACT client rule 4: two response shapes stay live and are told apart by
 // SHAPE, never by a flag. A unified database answers with the four-key body
-// (`graph` is an array and `llm_prompt` a string); a split database, and every
-// stored log, keeps the v2 shape (`graph_context`, `chunk_content`).
+// (`graph` and `forceful_relations` are arrays and `llm_prompt` a string); a
+// split database, and every stored log, keeps the v2 shape (`graph_context`,
+// `chunk_content`). The root key is `forceful_relations` only: a body that
+// still says `relations` is not the current contract and is not read as one.
 export function isUnifiedQueryResponse(response) {
   return Boolean(
     response &&
       typeof response === "object" &&
       Array.isArray(response.graph) &&
+      Array.isArray(response.forceful_relations) &&
       typeof response.llm_prompt === "string"
   );
 }
+
+// graph[].origin (CONTRACT): where a path came from. "query_path" is grown
+// from the query's entities, "chunk_relation" is the neighbourhood of a
+// returned chunk. Anything else is not a value the contract defines and is
+// left off rather than passed through.
+export const UNIFIED_GRAPH_ORIGINS = Object.freeze(["query_path", "chunk_relation"]);
 
 // The empty unified result, the shape every unified reader can rely on.
 export const EMPTY_UNIFIED_RECALL = Object.freeze({
   layout: "unified",
   chunks: [],
   graph: [],
-  relations: [],
+  forcefulRelations: [],
   llmPrompt: ""
 });
 
@@ -374,10 +383,11 @@ function normalizeUnifiedChunk(chunk) {
 // The four-key unified body (CONTRACT: POST /query on a unified database) in
 // the plugin's own names. chunks[] carry context_id/score/content/enrichment
 // and nothing about their source (GET /context/inspect by context_id for
-// that); graph[] is one flat list of paths with a path_summary each;
-// relations[] are the chunks pulled in by a forceful relation declared at
-// ingest; llm_prompt is the server-built string to inject, kept whole apart
-// from the secret redaction every injected text gets.
+// that); graph[] is one flat list of paths with a path_summary each and an
+// origin ("query_path" or "chunk_relation"); forceful_relations[] are the
+// chunks pulled in by a forceful relation declared at ingest; llm_prompt is
+// the server-built string to inject, kept whole apart from the secret
+// redaction every injected text gets.
 export function normalizeUnifiedResponse(response) {
   const chunks = (Array.isArray(response?.chunks) ? response.chunks : [])
     .map((chunk) => normalizeUnifiedChunk(chunk))
@@ -398,11 +408,12 @@ export function normalizeUnifiedResponse(response) {
       if (!triplets.length && !pathSummary) {
         return null;
       }
-      return { pathSummary, triplets };
+      const origin = UNIFIED_GRAPH_ORIGINS.includes(entry.origin) ? entry.origin : undefined;
+      return { ...(origin ? { origin } : {}), pathSummary, triplets };
     })
     .filter(Boolean);
 
-  const relations = (Array.isArray(response?.relations) ? response.relations : [])
+  const forcefulRelations = (Array.isArray(response?.forceful_relations) ? response.forceful_relations : [])
     .map((entry) => {
       const chunk = normalizeUnifiedChunk(entry?.chunk);
       if (!chunk) {
@@ -422,7 +433,7 @@ export function normalizeUnifiedResponse(response) {
     layout: "unified",
     chunks,
     graph,
-    relations,
+    forcefulRelations,
     llmPrompt: redactSecrets(response.llm_prompt)
   };
 }
@@ -752,24 +763,34 @@ export class HydraClient {
   }
 
   // One ranked list over everything in a unified database (no corpus selector).
+  //
+  // The answer must be the four-key body. Anything else (a body that still
+  // names the forceful-relations bucket `relations`, or a v2 body) is refused
+  // here with a named error, so it lands in the recall's errors rather than
+  // reaching the readers as a result without graph/forcefulRelations.
   async recallUnified(query, options = {}) {
-    return normalizeRetrievalResponse(
-      await this._hydra.context.query(
-        {
-          query,
-          kind: "unified",
-          mode: options.mode || "fast",
-          maxResults: options.maxResults || 6,
-          alpha: 0.8,
-          recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true,
-          ...(options.followForcefulRelations != null
-            ? { followForcefulRelations: options.followForcefulRelations }
-            : {})
-        },
-        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
-      )
+    const data = await this._hydra.context.query(
+      {
+        query,
+        kind: "unified",
+        mode: options.mode || "fast",
+        maxResults: options.maxResults || 6,
+        alpha: 0.8,
+        recencyBias: options.recencyBias ?? 0,
+        graphContext: options.graphContext ?? true,
+        ...(options.followForcefulRelations != null
+          ? { followForcefulRelations: options.followForcefulRelations }
+          : {})
+      },
+      { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
     );
+    if (!isUnifiedQueryResponse(data)) {
+      throw new Error(
+        "/query on a unified database did not answer with the unified body " +
+          "(chunks[], graph[], forceful_relations[], llm_prompt)"
+      );
+    }
+    return normalizeUnifiedResponse(data);
   }
 
   // One unified write (CONTRACT: POST /context/ingest as a JSON body whose

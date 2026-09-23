@@ -12,6 +12,13 @@
   "unified.chunks[].enrichment.kind",
   "unified.chunks[].enrichment.text",
   "unified.chunks[].score",
+  "unified.forcefulRelations[].chunk.chunkId",
+  "unified.forcefulRelations[].chunk.content",
+  "unified.forcefulRelations[].chunk.contextId",
+  "unified.forcefulRelations[].chunk.score",
+  "unified.forcefulRelations[].via.from",
+  "unified.forcefulRelations[].via.to",
+  "unified.graph[].origin",
   "unified.graph[].pathSummary",
   "unified.graph[].triplets[].relation.canonical_predicate",
   "unified.graph[].triplets[].relation.context",
@@ -19,11 +26,5 @@
   "unified.graph[].triplets[].source.name",
   "unified.graph[].triplets[].target.name",
   "unified.layout",
-  "unified.llmPrompt",
-  "unified.relations[].chunk.chunkId",
-  "unified.relations[].chunk.content",
-  "unified.relations[].chunk.contextId",
-  "unified.relations[].chunk.score",
-  "unified.relations[].via.from",
-  "unified.relations[].via.to"
+  "unified.llmPrompt"
 ]

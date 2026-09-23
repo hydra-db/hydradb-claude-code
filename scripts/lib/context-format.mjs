@@ -168,12 +168,19 @@ function pushUnifiedChunkLines(lines, chunk) {
   }
 }
 
+// The forceful-relations section as the server's llm_prompt spells it: these
+// chunks were linked by the author at ingest, not ranked for the query, and
+// the guide line says so to whoever reads the section.
+export const UNIFIED_FORCEFUL_RELATIONS_HEADING = "=== FORCEFUL RELATIONS ===";
+export const UNIFIED_FORCEFUL_RELATIONS_GUIDE =
+  "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.";
+
 // A unified recall rendered from its structured fields (CONTRACT: chunks[]
-// context_id/score/content/enrichment/temporal, relations[], graph[]
-// path_summary), in the same [n] / [Rn] / [Pn] labelling the server's
-// llm_prompt uses. This is the human-readable form for `query` text output,
-// and the fallback for the injected block only when a server sent no
-// llm_prompt.
+// context_id/score/content/enrichment/temporal, forceful_relations[], graph[]
+// path_summary), in the same [n] / [Rn] / [Pn] labelling and section headings
+// the server's llm_prompt uses. This is the human-readable form for `query`
+// text output, and the fallback for the injected block only when a server
+// sent no llm_prompt.
 export function buildUnifiedStructuredString(result) {
   const lines = [];
 
@@ -188,10 +195,12 @@ export function buildUnifiedStructuredString(result) {
     });
   }
 
-  const relations = Array.isArray(result?.relations) ? result.relations : [];
-  if (relations.length) {
-    lines.push("=== RELATED CONTEXT ===");
-    relations.forEach((entry, index) => {
+  const forcefulRelations = Array.isArray(result?.forcefulRelations) ? result.forcefulRelations : [];
+  if (forcefulRelations.length) {
+    lines.push(UNIFIED_FORCEFUL_RELATIONS_HEADING);
+    lines.push(UNIFIED_FORCEFUL_RELATIONS_GUIDE);
+    lines.push("");
+    forcefulRelations.forEach((entry, index) => {
       const via = entry.via?.from ? ` (via ${entry.via.from})` : "";
       lines.push(`[R${index + 1}] context_id: ${entry.chunk?.contextId || "(unknown)"}${via}`);
       pushUnifiedChunkLines(lines, entry.chunk);

@@ -306,8 +306,8 @@ export function createHydraWrapper({
       const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
       if (unifiedKind(args)) {
         // CONTRACT (POST /query on a unified database): the v2 request fields
-        // and NO `type`; follow_forceful_relations selects the relations[]
-        // bucket of the four-key response.
+        // and NO `type`; follow_forceful_relations selects the
+        // forceful_relations[] bucket of the four-key response.
         return unwrapAndNormalize(
           await rawJson("/query", "POST", "/query", {
             ...contextScope(),
