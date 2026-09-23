@@ -363,7 +363,15 @@ export async function syncWorkspace({
   // file too large to go whole takes the chunked (memory-shaped) path. Both
   // lanes land in the same one corpus there. A split database keeps its
   // configured sizes exactly.
-  const unified = typeof client?.isUnified === "function" ? await client.isUnified() : false;
+  // Sync runs in the background (120s), so a probe that timed out is asked
+  // again patiently before files are cut: a unified database must never be
+  // synced with split-sized pieces the server refuses.
+  const unified =
+    typeof client?.resolveLayoutPatiently === "function"
+      ? (await client.resolveLayoutPatiently()) === "unified"
+      : typeof client?.isUnified === "function"
+        ? await client.isUnified()
+        : false;
   const config = unified
     ? { ...baseConfig, maxMemoryCharsPerChunk: Math.min(baseConfig.maxMemoryCharsPerChunk, UNIFIED_MAX_CHUNK_CHARS) }
     : baseConfig;

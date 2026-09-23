@@ -895,6 +895,28 @@ export class HydraClient {
     return this._layoutPromise;
   }
 
+  // For background work (workspace sync has 120s, not a prompt's 20s): when
+  // the short probe could not answer, ask once more with the full request
+  // timeout before deciding how to cut files, so a slow probe does not leave
+  // a unified database synced with split-sized pieces the server refuses.
+  async resolveLayoutPatiently() {
+    const first = await this.layoutState();
+    if (first !== "unknown") {
+      return first;
+    }
+    try {
+      const layout = await this._hydra.databases.knownLayout(this.tenantId, { timeoutMs: this.requestTimeoutMs });
+      if (layout) {
+        this._layoutPromise = Promise.resolve(layout);
+        await this._writeLayoutCache(layout);
+        return layout;
+      }
+    } catch (error) {
+      await this._debug("layout-probe", { outcome: "failed (patient)", error: String(error?.message ?? error) });
+    }
+    return "unknown";
+  }
+
   async _readLayoutCache() {
     if (!this._layoutCacheFile) {
       return null;
@@ -920,7 +942,12 @@ export class HydraClient {
         all = {};
       }
       all[this._layoutCacheKey] = { layout, at: Date.now() };
-      await fs.writeFile(this._layoutCacheFile, JSON.stringify(all), { mode: 0o600 });
+      // Written to a temp file and renamed into place (as state.json is), so a
+      // concurrent hook never reads half-written JSON. Two writers racing can
+      // still drop each other's key; that only costs a later probe.
+      const tempPath = `${this._layoutCacheFile}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(all), { mode: 0o600 });
+      await fs.rename(tempPath, this._layoutCacheFile);
     } catch {
       // The cache is an optimisation: a write that fails costs one probe later.
     }

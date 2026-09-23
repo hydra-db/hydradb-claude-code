@@ -306,18 +306,19 @@ export function fitUnifiedPrompt(result, maxChars) {
       }
     }
   }
+  // Every occurrence of every body is located, not just the first: a
+  // result that is also a forceful relation appears twice, and leaving one
+  // copy whole would push the prompt into the last-resort cut. Longer bodies
+  // claim their spans first; a span that overlaps one already claimed is left
+  // to it.
   const located = [];
-  let cursor = 0;
-  for (const body of bodies) {
-    let at = prompt.indexOf(body.text, cursor);
-    if (at < 0) {
-      at = prompt.indexOf(body.text);
+  const byLength = [...bodies].sort((x, y) => y.text.length - x.text.length);
+  for (const body of byLength) {
+    for (let at = prompt.indexOf(body.text); at >= 0; at = prompt.indexOf(body.text, at + body.text.length)) {
+      if (!located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
+        located.push({ ...body, at });
+      }
     }
-    if (at < 0 || located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
-      continue;
-    }
-    located.push({ ...body, at });
-    cursor = at + body.text.length;
   }
 
   const noteAllowance = 90;
@@ -345,6 +346,26 @@ export function fitUnifiedPrompt(result, maxChars) {
       : `${cut} … [shortened: ${cut.length} of ${l.text.length} characters${l.id ? `, id ${l.id}` : ""}]`;
   }
   text += prompt.slice(from);
+
+  // Still over: shorten every long line that is not the prompt's own
+  // structure (headings, the `- **Relevance:**`/`- **Id:**` lines, fact and
+  // source lines, rules), longest first, so headings, ids and [n]/[Rn]/[Pn]
+  // labels survive. Only if that is not enough does the prefix cut apply.
+  if (text.length > maxChars) {
+    const structural = /^(#{1,6} |- \*\*|- \[|\d+\. |---\s*$|\*\*Id:)/;
+    const lines = text.split("\n");
+    const candidates = lines
+      .map((line, index) => ({ index, length: line.length }))
+      .filter((c) => c.length > 160 && !structural.test(lines[c.index]))
+      .sort((x, y) => y.length - x.length);
+    for (const c of candidates) {
+      if (lines.join("\n").length <= maxChars) {
+        break;
+      }
+      lines[c.index] = `${cutAtWord(lines[c.index], 120) ?? lines[c.index]} …`;
+    }
+    text = lines.join("\n");
+  }
 
   if (text.length > maxChars) {
     const note = "\n[recall cut to fit the context budget]";
@@ -431,4 +452,124 @@ export function buildHydraContextBlock({ query, unified, memory, knowledge, erro
   lines.push(body);
   lines.push(footer);
   return lines.join("\n");
+}
+
+// PRO-2193: the query skill's output reaches the model through a tool result,
+// which the host truncates too (~30k characters). A unified recall carries the
+// same text twice (llm_prompt and chunks[]), so the prompt is held to
+// QUERY_OUTPUT_CHARS (fitted without losing a citation) and each chunk body to
+// QUERY_CHUNK_CHARS, flagged with its full length; together they stay well
+// under the host's cut. A split recall is printed as before.
+export const QUERY_OUTPUT_CHARS = 12_000;
+export const QUERY_CHUNK_CHARS = 800;
+// The whole --json payload, whatever the recall carries besides the prompt
+// and chunk bodies (enrichment, temporal facts, graph triplets, forceful
+// relations): held under the host's tool-output cut.
+export const QUERY_JSON_CHARS = 24_000;
+
+// Reduce a unified recall until the payload fits QUERY_JSON_CHARS, one step
+// at a time and only as far as needed, flagging each: enrichment and temporal
+// facts shortened, graph paths down to their summaries, chunk bodies cut
+// further, graph paths dropped from the end, every body down to a stub, then
+// forceful relations dropped from the end, counts kept. Context ids and scores always stay, so every result is
+// still citable and fetchable.
+export function fitRecallPayload(payload) {
+  const size = () => JSON.stringify(payload).length;
+  const unified = payload.unified;
+  if (!unified || size() <= QUERY_JSON_CHARS) {
+    return payload;
+  }
+  const chunks = () => [
+    ...(Array.isArray(unified.chunks) ? unified.chunks : []),
+    ...(Array.isArray(unified.forcefulRelations) ? unified.forcefulRelations.map((r) => r?.chunk).filter(Boolean) : [])
+  ];
+  const clip = (text, max) => (typeof text === "string" && text.length > max ? `${text.slice(0, max)}…` : text);
+  const steps = [
+    () => {
+      for (const c of chunks()) {
+        if (typeof c.enrichment === "string" && c.enrichment.length > 300) {
+          c.enrichment = clip(c.enrichment, 300);
+          c.enrichmentTruncated = true;
+        }
+        if (Array.isArray(c.temporal) && c.temporal.length > 2) {
+          c.temporal = c.temporal.slice(0, 2);
+          c.temporalTruncated = true;
+        }
+      }
+    },
+    () => {
+      if (Array.isArray(unified.graph)) {
+        unified.graph = unified.graph.map((path) => ({
+          ...(path.origin ? { origin: path.origin } : {}),
+          pathSummary: clip(path.pathSummary, 300)
+        }));
+        unified.graphTripletsOmitted = true;
+      }
+    },
+    () => {
+      for (const c of chunks()) {
+        if (typeof c.content === "string" && c.content.length > 300) {
+          c.contentChars = c.contentChars ?? c.content.length;
+          c.content = c.content.slice(0, 300);
+          c.contentTruncated = true;
+        }
+      }
+    },
+    () => {
+      const total = Array.isArray(unified.graph) ? unified.graph.length : 0;
+      while (size() > QUERY_JSON_CHARS && unified.graph?.length) unified.graph.pop();
+      if (total && unified.graph.length < total) unified.graphPathsTotal = total;
+    },
+    () => {
+      // Many results: every body, enrichment and temporal list down to a
+      // stub, each flagged, before anything is dropped.
+      for (const c of chunks()) {
+        if (typeof c.content === "string" && c.content.length > 120) {
+          c.contentChars = c.contentChars ?? c.content.length;
+          c.content = c.content.slice(0, 120);
+          c.contentTruncated = true;
+        }
+        if (typeof c.enrichment === "string" && c.enrichment.length > 120) {
+          c.enrichment = clip(c.enrichment, 120);
+          c.enrichmentTruncated = true;
+        }
+        if (Array.isArray(c.temporal) && c.temporal.length) {
+          delete c.temporal;
+          c.temporalTruncated = true;
+        }
+      }
+    },
+    () => {
+      const total = Array.isArray(unified.forcefulRelations) ? unified.forcefulRelations.length : 0;
+      while (size() > QUERY_JSON_CHARS && unified.forcefulRelations?.length) unified.forcefulRelations.pop();
+      if (total && unified.forcefulRelations.length < total) unified.forcefulRelationsTotal = total;
+    }
+  ];
+  for (const step of steps) {
+    if (size() <= QUERY_JSON_CHARS) {
+      break;
+    }
+    step();
+  }
+  return payload;
+}
+
+export function boundUnifiedRecall(unified) {
+  if (!unified || typeof unified !== "object") {
+    return unified;
+  }
+  const boundChunk = (chunk) => {
+    if (!chunk || typeof chunk.content !== "string" || chunk.content.length <= QUERY_CHUNK_CHARS) {
+      return chunk;
+    }
+    return { ...chunk, content: chunk.content.slice(0, QUERY_CHUNK_CHARS), contentTruncated: true, contentChars: chunk.content.length };
+  };
+  return {
+    ...unified,
+    ...(typeof unified.llmPrompt === "string" ? { llmPrompt: fitUnifiedPrompt(unified, QUERY_OUTPUT_CHARS) } : {}),
+    chunks: Array.isArray(unified.chunks) ? unified.chunks.map(boundChunk) : unified.chunks,
+    forcefulRelations: Array.isArray(unified.forcefulRelations)
+      ? unified.forcefulRelations.map((r) => (r && r.chunk ? { ...r, chunk: boundChunk(r.chunk) } : r))
+      : unified.forcefulRelations
+  };
 }

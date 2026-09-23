@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { fitUnifiedPrompt, buildHydraContextBlock } from "../scripts/lib/context-format.mjs";
+import { fitRecallPayload, fitUnifiedPrompt, buildHydraContextBlock, QUERY_JSON_CHARS } from "../scripts/lib/context-format.mjs";
 import {
   HydraClient,
   normalizeRetrievalResponse,
@@ -258,6 +258,104 @@ export async function runUnifiedFixTests() {
     assert.ok(items.every((i) => (i.text || "").length <= UNIFIED_MAX_CHUNK_CHARS), "every piece fits the unified cap");
     assert.equal(summary.errors.length, 0, summary.errors.join("; "));
     assert.equal(Object.keys(state.files).length, 2, "both files recorded as synced");
+    tests += 1;
+  }
+
+  // 8) Greptile on #14: a body that appears twice (a result that is also a
+  //    forceful relation) is shortened in both places, and when bodies cannot
+  //    carry the cut, long non-structural lines are shortened before any
+  //    prefix cut, so later headings, ids and [Rn]/[Pn] labels survive.
+  {
+    const body = "Refund window details. ".repeat(600).trim();
+    const prompt = [
+      "## Results", "", "### 1. policy", "- **Id:** p-1", "", body, "", "---",
+      "### 2. other", "- **Id:** o-2", "", "second", "",
+      "## Forceful relations", "", "### R1. policy (linked)", "- **Id:** p-1", "", body, "",
+      "## Related facts", "", "- [P1] refund -owned by-> finance [1][R1]",
+      "", "An unlocatable paragraph the server added. ".repeat(200)
+    ].join("\n");
+    const recall = {
+      llmPrompt: prompt,
+      chunks: [{ contextId: "p-1", content: body }, { contextId: "o-2", content: "second" }],
+      forcefulRelations: [{ via: { from: "o-2", to: "p-1" }, chunk: { contextId: "p-1", content: body } }],
+      graph: []
+    };
+    const fitted = fitUnifiedPrompt(recall, 4000);
+    assert.ok(fitted.length <= 4000, `fitted (${fitted.length})`);
+    for (const kept of ["### 1. policy", "### 2. other", "### R1. policy (linked)", "- [P1] refund -owned by-> finance [1][R1]"]) {
+      assert.ok(fitted.includes(kept), `kept: ${kept}`);
+    }
+    assert.equal((fitted.match(/shortened: \d+ of \d+ characters, id p-1/g) || []).length, 2, "both copies shortened");
+    assert.ok(!/recall cut to fit/.test(fitted), "no prefix cut was needed");
+    tests += 1;
+  }
+
+  // 9) Greptile on #14: when the short probe times out, workspace sync asks
+  //    again patiently (it has 120s) before cutting files, so a unified
+  //    database still gets unified-sized pieces.
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-sync-patient-"));
+    await fs.writeFile(path.join(dir, "BIG.md"), Array.from({ length: 30 }, () => "lorem ipsum ".repeat(2500)).join("\n\n"), "utf8");
+    let probes = 0;
+    const sink = [];
+    const client = new HydraClient({
+      ...SCOPE,
+      fetch: capturingFetch(sink, (req) => {
+        if (req.path === "/databases") {
+          probes += 1;
+          return probes === 1 ? { __status: 503, success: false, error: { message: "slow" } } : unifiedProbe;
+        }
+        return ingest202(JSON.parse(req.bodyString).context);
+      })
+    });
+    const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
+    await syncWorkspace({
+      client,
+      config: {
+        includeGlobs: ["*.md"], excludeGlobs: [], maxFileSizeBytes: 50 * 1024 * 1024, maxFilesPerSync: 25,
+        maxMemoryCharsPerChunk: 50 * 1024 * 1024, maxMemoryChunksPerFile: 1, ingestionMode: "memory",
+        writeTimeoutMs: 15000, userName: "", workspaceMemoryCustomInstructions: ""
+      },
+      projectRoot: dir,
+      workspaceName: "t",
+      state
+    });
+    assert.equal(probes, 2, "the probe was retried patiently");
+    const items = sink.filter((r) => r.path === "/context/ingest").flatMap((r) => JSON.parse(r.bodyString).context);
+    assert.ok(items.length >= 3 && items.every((i) => i.text.length <= UNIFIED_MAX_CHUNK_CHARS), "unified-sized pieces");
+    tests += 1;
+  }
+
+  // 10) Greptile on #14: concurrent layout-cache writes never leave a torn
+  //     file behind (temp file + rename).
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-cache-race-"));
+    const cacheFile = path.join(dir, "layout-cache.json");
+    const clients = Array.from({ length: 20 }, (_, i) =>
+      new HydraClient({ ...SCOPE, tenantId: `db_${i}`, layoutCacheFile: cacheFile, fetch: capturingFetch([], () => unifiedProbe) }));
+    await Promise.all(clients.map((c) => c._writeLayoutCache("unified")));
+    JSON.parse(await fs.readFile(cacheFile, "utf8"));
+    assert.deepEqual((await fs.readdir(dir)).filter((f) => f.endsWith(".tmp")), [], "no temp files left");
+    tests += 1;
+  }
+
+  // 11) Greptile on #14: the whole query --json payload is bounded, not just
+  //     llm_prompt and chunk bodies; ids and scores always stay.
+  {
+    const long = (n) => "x ".repeat(n);
+    const unified = {
+      llmPrompt: "short prompt",
+      chunks: Array.from({ length: 30 }, (_, i) => ({
+        contextId: `c${i}`, score: 0.5, content: long(400), enrichment: long(2000),
+        temporal: Array.from({ length: 10 }, () => ({ content: long(200) }))
+      })),
+      graph: Array.from({ length: 200 }, () => ({ pathSummary: long(600), triplets: [{ source: { name: long(100) } }] })),
+      forcefulRelations: Array.from({ length: 40 }, (_, i) => ({ via: { from: "c0", to: `f${i}` }, chunk: { contextId: `f${i}`, content: long(400) } }))
+    };
+    const payload = fitRecallPayload({ query: "q", searchMode: "unified", unified, errors: [] });
+    assert.ok(JSON.stringify(payload).length <= QUERY_JSON_CHARS, `bounded (${JSON.stringify(payload).length})`);
+    assert.deepEqual(payload.unified.chunks.map((c) => c.contextId), unified.chunks.map((_, i) => `c${i}`), "every chunk id kept");
+    assert.ok(payload.unified.chunks.every((c) => c.score === 0.5), "scores kept");
     tests += 1;
   }
 
