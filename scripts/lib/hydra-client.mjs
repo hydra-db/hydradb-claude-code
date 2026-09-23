@@ -692,10 +692,12 @@ function parseMaybeJson(value) {
 // depends on the wire spelling; the raw data stays attached.
 // Every string in the 202 is server-provided and some of it is printed (the
 // context id after `ingest --note`, refusal reasons in the raised error) or
-// returned as JSON, so each is redacted, stripped of terminal control
-// sequences and bounded.
+// returned as JSON, so each is stripped of terminal control sequences,
+// redacted and bounded. Stripping comes first: a control character inside a
+// key would otherwise hide it from the secret patterns and the strip would
+// then join it back together.
 function ingestResponseText(value, maxLength) {
-  return trimText(stripControlChars(redactSecrets(String(value))), maxLength);
+  return trimText(redactSecrets(stripControlChars(String(value))), maxLength);
 }
 
 export function parseUnifiedIngestResponse(data) {

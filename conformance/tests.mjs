@@ -857,6 +857,14 @@ export async function runHttpTests() {
     assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(hostile.failed[0].error), "no control characters in the reason");
     assert.ok(!hostile.failed[0].error.includes("abcdefghijklmnop"), "a secret-shaped reason is redacted");
     assert.equal(hostile.failed[0].errorCode, "E");
+    const splitKey = parseUnifiedIngestResponse({
+      results: [{ source_id: "sk-ant-abcdefgh\u0007ijklmnopqrstuvwxyz", status: "queued" }]
+    });
+    assert.deepEqual(
+      splitKey.contextIds,
+      ["[REDACTED:anthropic]"],
+      "a key split by a control character is rejoined and then redacted"
+    );
   }
 
   // 12c) A 202 that refuses an item is a FAILED write, not a return value.
