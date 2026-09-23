@@ -384,7 +384,8 @@ export async function runHttpTests() {
       chunkId: "ck_9f2",
       score: 0.87,
       content: "user: Keep answers short please\nassistant: Got it.",
-      enrichment: { text: "User prefers short, bullet-point answers.", kind: "user_preference" }
+      enrichment: "User prefers short, bullet-point answers.",
+      enrichmentKind: "user_preference"
     });
     assert.deepEqual(res.chunks[1].temporal, [
       {
@@ -394,6 +395,11 @@ export async function runHttpTests() {
       }
     ]);
     assert.ok(!("enrichment" in res.chunks[1]), "enrichment is absent when the server sent none");
+    assert.equal(
+      res.chunks[1].enrichmentKind,
+      "business_knowledge",
+      "enrichment_kind is kept even when the chunk has no enrichment"
+    );
     assert.equal(res.graph.length, 2);
     assert.equal(res.graph[0].origin, "query_path");
     assert.equal(res.graph[0].pathSummary, "John is on the Pro plan since June 2026.");
@@ -404,6 +410,12 @@ export async function runHttpTests() {
     assert.deepEqual(res.forcefulRelations[0].via, { from: "linear-PRO-1169", to: "linear-PRO-1169-comment-4" });
     assert.equal(res.forcefulRelations[0].chunk.contextId, "linear-PRO-1169-comment-4");
     assert.equal(res.forcefulRelations[0].chunk.content, "Comment 4: shipped the fix in #1625.");
+    assert.equal(
+      res.forcefulRelations[0].chunk.enrichment,
+      "The PRO-1169 fix shipped in #1625.",
+      "a forceful relation's chunk has the same enrichment string"
+    );
+    assert.equal(res.forcefulRelations[0].chunk.enrichmentKind, "decision_trace");
     assert.deepEqual(Object.keys(res).sort(), ["chunks", "forcefulRelations", "graph", "layout", "llmPrompt"]);
     for (const key of ["chunk_content", "graph_context", "sources", "additional_context", "relations"]) {
       assert.ok(!(key in res), `no split-era or superseded key ${key} on a unified result`);
@@ -498,14 +510,14 @@ export async function runHttpTests() {
     });
     assert.ok(block.startsWith("<hydradb-context>\n"));
     assert.ok(block.includes(`\n${UNIFIED_QUERY_RESPONSE.llm_prompt}\n`), "llm_prompt is injected verbatim");
-    for (const label of ["[1]", "[2]", "[R1]", "[P1]", "[P2]"]) {
+    for (const label of ["### 1.", "### 2.", "### R1.", "[P1]", "[P2]"]) {
       assert.ok(block.includes(label), `citation label ${label} survives`);
     }
     assert.ok(
-      block.includes(`=== FORCEFUL RELATIONS ===\n${UNIFIED_FORCEFUL_RELATIONS_GUIDE}\n`),
+      block.includes(`## Forceful relations\n\n${UNIFIED_FORCEFUL_RELATIONS_GUIDE}\n`),
       "the forceful-relations heading and its guide line reach the model as the server wrote them"
     );
-    assert.ok(!block.includes("=== RELATED CONTEXT ==="), "the superseded heading is gone");
+    assert.ok(!block.includes("=== "), "none of the superseded === SECTION === layout");
     assert.ok(!/=== (MEMORY|KNOWLEDGE) /.test(block), "no split-era section headers");
     assert.ok(!/Chunk 1\nSource:/.test(block), "the chunk template is not rebuilt around the prompt");
     assert.equal(
@@ -515,29 +527,88 @@ export async function runHttpTests() {
     );
 
     // The structured rendering (query text output, and the only fallback)
-    // carries every field the contract puts on a chunk, temporal facts included.
+    // carries every field the contract puts on a chunk, temporal facts
+    // included, in the server's markdown layout.
     const structured = buildUnifiedStructuredString(unified);
-    assert.ok(structured.includes("[1] context_id: chat-2026-07-29#w2 (score 0.87)"));
-    assert.ok(structured.includes("Enrichment: User prefers short, bullet-point answers."));
+    assert.ok(structured.startsWith("## Results\n\n### 1. chat-2026-07-29#w2\n"));
+    assert.ok(structured.includes("- **Relevance:** 0.87 · **Category:** user_preference"));
+    assert.ok(structured.includes("\n**Enrichment:** User prefers short, bullet-point answers.\n"));
     assert.ok(
-      structured.includes("Temporal: Refund window was 14 days. Start: 2025-01-01, End: 2026-06-30"),
+      structured.includes("### 2. policy-1\n- **Relevance:** 0.61 · **Category:** business_knowledge\n"),
+      "a declared category is shown even with no enrichment"
+    );
+    assert.ok(
+      structured.includes("**Temporal:** Refund window was 14 days. Start: 2025-01-01, End: 2026-06-30"),
       "a temporal fact is rendered with the chunk it dates"
     );
-    assert.equal(UNIFIED_FORCEFUL_RELATIONS_HEADING, "=== FORCEFUL RELATIONS ===");
+    assert.equal(UNIFIED_FORCEFUL_RELATIONS_HEADING, "## Forceful relations");
     assert.ok(
       structured.includes(
         [
-          "=== FORCEFUL RELATIONS ===",
+          "## Forceful relations",
+          "",
           "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.",
           "",
-          "[R1] context_id: linear-PRO-1169-comment-4 (via linear-PRO-1169)"
+          "### R1. linear-PRO-1169-comment-4",
+          "- **Linked from:** linear-PRO-1169 · **Category:** decision_trace",
+          "",
+          "Comment 4: shipped the fix in #1625.",
+          "",
+          "**Enrichment:** The PRO-1169 fix shipped in #1625."
         ].join("\n")
       ),
-      "the structured form uses the server's heading and guide line"
+      "the structured form uses the server's heading, guide line and result layout"
     );
-    assert.ok(!structured.includes("RELATED CONTEXT"), "the superseded heading is gone");
-    assert.ok(structured.includes("[P1] John is on the Pro plan since June 2026."));
-    assert.ok(structured.includes("[P2] The refund policy allows refunds within 30 days."));
+    assert.ok(!structured.includes("=== "), "none of the superseded === SECTION === layout");
+    assert.ok(structured.includes("## Related facts\n\n- [P1] **John** -subscribed to→ **Pro plan** (query path)\n"));
+    assert.ok(structured.includes("  John is on the Pro plan since June 2026."));
+    assert.ok(structured.includes("- [P2] **Refund policy** -allows refunds within→ **30 days** (chunk relation)"));
+  }
+
+  // 10e) The real envelope the server's own handler test renders (PRO-1618
+  //      final shape): enrichment is a string, enrichment_kind sits beside it
+  //      on chunks[] and forceful_relations[].chunk, and llm_prompt is the
+  //      markdown layout. It is read end to end through recallUnified.
+  {
+    const envelope = JSON.parse(
+      await fs.readFile(new URL("./unified-query-envelope.json", import.meta.url), "utf8")
+    );
+    const client = new HydraClient({ ...SCOPE, fetch: capturingFetch([], () => envelope) });
+    const res = await client.recallUnified("who owns refund processing?");
+    assert.equal(res.layout, "unified");
+    assert.deepEqual(
+      res.chunks.map((chunk) => [chunk.contextId, chunk.enrichment, chunk.enrichmentKind]),
+      [
+        ["refund-policy", "Refund window is 30 days; Finance owns refund processing.", "business_knowledge"],
+        ["chat-2026-07-29", "User prefers short answers about refunds.", "user_preference"]
+      ]
+    );
+    assert.deepEqual(res.chunks[0].temporal, [
+      {
+        content: "Refund policy effective_from June 2026. Start: 2026-06-01",
+        startDate: "2026-06-01",
+        endDate: null
+      }
+    ]);
+    assert.equal(res.forcefulRelations[0].chunk.contextId, "refund-faq");
+    assert.ok(!("enrichment" in res.forcefulRelations[0].chunk), "no enrichment when the server sent none");
+    assert.ok(!("enrichmentKind" in res.forcefulRelations[0].chunk), "no enrichmentKind when none was declared");
+    assert.deepEqual(
+      res.graph.map((path) => path.origin),
+      ["query_path", "chunk_relation"]
+    );
+    assert.equal(res.llmPrompt, envelope.data.llm_prompt, "the markdown llm_prompt is kept whole");
+    assert.ok(res.llmPrompt.startsWith("# Query results\n"));
+    assert.ok(res.llmPrompt.includes("**Enrichment:** Refund window is 30 days; Finance owns refund processing."));
+    assert.ok(!res.llmPrompt.includes("=== "), "the real prompt has no === SECTION === layout");
+
+    // The old object form is not the contract any more and is not read as one.
+    const legacy = normalizeRetrievalResponse({
+      ...envelope.data,
+      chunks: [{ ...envelope.data.chunks[0], enrichment: { text: "old", kind: "user_preference" } }]
+    });
+    assert.ok(!("enrichment" in legacy.chunks[0]), "an {text, kind} object is not an enrichment string");
+    assert.equal(legacy.chunks[0].enrichmentKind, "business_knowledge");
   }
 
   // 11) Unified delete is a hand-built DELETE /context with NO `type`
@@ -1073,7 +1144,7 @@ export async function runHttpTests() {
     assert.deepEqual(JSON.parse(sink.at(-1).bodyString), { database: "new_db", type: "unified" });
   }
 
-  return { tests: 27 };
+  return { tests: 28 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

@@ -356,14 +356,19 @@ function normalizeUnifiedChunk(chunk) {
     score: typeof chunk.score === "number" ? chunk.score : undefined,
     content: trimText(redactSecrets(typeof chunk.content === "string" ? chunk.content : ""))
   };
-  if (chunk.enrichment && typeof chunk.enrichment === "object") {
-    const text = trimText(
-      redactSecrets(typeof chunk.enrichment.text === "string" ? chunk.enrichment.text : "")
-    );
-    const kind = typeof chunk.enrichment.kind === "string" ? chunk.enrichment.kind : "";
-    if (text || kind) {
-      normalized.enrichment = { text, ...(kind ? { kind } : {}) };
-    }
+  // enrichment is a plain string (CONTRACT), omitted when empty; its declared
+  // context_category rides beside it as enrichment_kind, which can be present
+  // with no enrichment at all. Each is kept only when it holds text.
+  const enrichment = trimText(redactSecrets(typeof chunk.enrichment === "string" ? chunk.enrichment : ""));
+  if (enrichment) {
+    normalized.enrichment = enrichment;
+  }
+  const enrichmentKind = trimText(
+    redactSecrets(typeof chunk.enrichment_kind === "string" ? chunk.enrichment_kind : ""),
+    80
+  );
+  if (enrichmentKind) {
+    normalized.enrichmentKind = enrichmentKind;
   }
   if (Array.isArray(chunk.temporal) && chunk.temporal.length) {
     normalized.temporal = chunk.temporal
@@ -374,16 +379,17 @@ function normalizeUnifiedChunk(chunk) {
         endDate: fact.end_date ?? null
       }));
   }
-  if (!normalized.content && !normalized.enrichment?.text) {
+  if (!normalized.content && !normalized.enrichment) {
     return null;
   }
   return normalized;
 }
 
 // The four-key unified body (CONTRACT: POST /query on a unified database) in
-// the plugin's own names. chunks[] carry context_id/score/content/enrichment
-// and nothing about their source (GET /context/inspect by context_id for
-// that); graph[] is one flat list of paths with a path_summary each and an
+// the plugin's own names. chunks[] carry context_id/score/content, the
+// enrichment string and its enrichment_kind (enrichmentKind here), and
+// nothing about their source (GET /context/inspect by context_id for that);
+// graph[] is one flat list of paths with a path_summary each and an
 // origin ("query_path" or "chunk_relation"); forceful_relations[] are the
 // chunks pulled in by a forceful relation declared at ingest; llm_prompt is
 // the server-built string to inject, kept whole apart from the secret

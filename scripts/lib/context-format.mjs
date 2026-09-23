@@ -150,84 +150,118 @@ export function buildContextString(label, result) {
   return lines.join("\n").trim();
 }
 
-// One unified chunk's body: its content, its enrichment, and every temporal
+// One unified result as the server's markdown llm_prompt lays it out: a
+// `### n.` heading, a meta line (relevance or where it was linked from, and
+// the declared category), the content, its enrichment, and every temporal
 // fact the query engaged (CONTRACT: chunks[].temporal is present only then,
 // and it is the dated version of the claim, so leaving it out would drop the
-// one thing that says when the content held).
-function pushUnifiedChunkLines(lines, chunk) {
+// one thing that says when the content held). Chunks carry no source title,
+// so the heading names the context_id.
+function pushUnifiedChunkLines(lines, chunk, label, linkedFrom) {
+  lines.push(`### ${label}. ${chunk?.contextId || "(unknown)"}`);
+  const meta = [];
+  if (linkedFrom) {
+    meta.push(`**Linked from:** ${linkedFrom}`);
+  } else if (typeof chunk?.score === "number") {
+    meta.push(`**Relevance:** ${chunk.score.toFixed(2)}`);
+  }
+  if (chunk?.enrichmentKind) {
+    meta.push(`**Category:** ${chunk.enrichmentKind}`);
+  }
+  if (meta.length) {
+    lines.push(`- ${meta.join(" · ")}`);
+  }
   if (chunk?.content) {
-    lines.push(truncateText(chunk.content, 700));
+    lines.push("", truncateText(chunk.content, 700));
   }
-  if (chunk?.enrichment?.text) {
-    lines.push(`Enrichment: ${truncateText(chunk.enrichment.text, 280)}`);
+  if (chunk?.enrichment) {
+    lines.push("", `**Enrichment:** ${truncateText(chunk.enrichment, 280)}`);
   }
-  for (const fact of Array.isArray(chunk?.temporal) ? chunk.temporal : []) {
-    if (fact?.content) {
-      lines.push(`Temporal: ${truncateText(fact.content, 280)}`);
+  const temporal = (Array.isArray(chunk?.temporal) ? chunk.temporal : []).filter((fact) => fact?.content);
+  if (temporal.length) {
+    lines.push("");
+    for (const fact of temporal) {
+      lines.push(`**Temporal:** ${truncateText(fact.content, 280)}`);
     }
   }
+  lines.push("");
+}
+
+// One graph path as a `## Related facts` line: its triplets as
+// `**A** -predicate→ **B**`, the origin in words, then the path summary.
+function formatUnifiedPath(path, index) {
+  const triplets = Array.isArray(path?.triplets) ? path.triplets : [];
+  const chain = triplets
+    .map((triplet) => {
+      const source = safeString(triplet?.source?.name);
+      const predicate = safeString(triplet?.relation?.canonical_predicate || triplet?.relation?.predicate);
+      const target = safeString(triplet?.target?.name);
+      if (!source && !predicate && !target) {
+        return "";
+      }
+      return `**${source || "source"}** -${predicate || "related to"}→ **${target || "target"}**`;
+    })
+    .filter(Boolean)
+    .join("; ");
+  const origin = path?.origin ? ` (${path.origin.replace("_", " ")})` : "";
+  const lines = [];
+  if (chain) {
+    lines.push(`- [P${index + 1}] ${chain}${origin}`);
+    if (path.pathSummary) {
+      lines.push(`  ${path.pathSummary}`);
+    }
+  } else if (path?.pathSummary) {
+    lines.push(`- [P${index + 1}] ${path.pathSummary}${origin}`);
+  }
+  return lines;
 }
 
 // The forceful-relations section as the server's llm_prompt spells it: these
 // chunks were linked by the author at ingest, not ranked for the query, and
 // the guide line says so to whoever reads the section.
-export const UNIFIED_FORCEFUL_RELATIONS_HEADING = "=== FORCEFUL RELATIONS ===";
+export const UNIFIED_FORCEFUL_RELATIONS_HEADING = "## Forceful relations";
 export const UNIFIED_FORCEFUL_RELATIONS_GUIDE =
   "Linked to a result by the author at ingest time (forceful_relations), not by relevance to this query.";
 
 // A unified recall rendered from its structured fields (CONTRACT: chunks[]
-// context_id/score/content/enrichment/temporal, forceful_relations[], graph[]
-// path_summary), in the same [n] / [Rn] / [Pn] labelling and section headings
-// the server's llm_prompt uses. This is the human-readable form for `query`
-// text output, and the fallback for the injected block only when a server
-// sent no llm_prompt.
+// context_id/score/content/enrichment/enrichment_kind/temporal,
+// forceful_relations[], graph[] path_summary), in the markdown layout and the
+// n / Rn / [Pn] labelling the server's llm_prompt uses (`## Results`,
+// `## Forceful relations`, `## Related facts`). This is the human-readable
+// form for `query` text output, and the fallback for the injected block only
+// when a server sent no llm_prompt.
 export function buildUnifiedStructuredString(result) {
   const lines = [];
 
   const chunks = Array.isArray(result?.chunks) ? result.chunks : [];
   if (chunks.length) {
-    lines.push("=== CONTEXT ===");
+    lines.push("## Results", "");
     chunks.forEach((chunk, index) => {
-      const score = typeof chunk.score === "number" ? ` (score ${chunk.score.toFixed(2)})` : "";
-      lines.push(`[${index + 1}] context_id: ${chunk.contextId || "(unknown)"}${score}`);
-      pushUnifiedChunkLines(lines, chunk);
-      lines.push("");
+      pushUnifiedChunkLines(lines, chunk, String(index + 1));
     });
   }
 
   const forcefulRelations = Array.isArray(result?.forcefulRelations) ? result.forcefulRelations : [];
   if (forcefulRelations.length) {
-    lines.push(UNIFIED_FORCEFUL_RELATIONS_HEADING);
-    lines.push(UNIFIED_FORCEFUL_RELATIONS_GUIDE);
-    lines.push("");
+    lines.push(UNIFIED_FORCEFUL_RELATIONS_HEADING, "", UNIFIED_FORCEFUL_RELATIONS_GUIDE, "");
     forcefulRelations.forEach((entry, index) => {
-      const via = entry.via?.from ? ` (via ${entry.via.from})` : "";
-      lines.push(`[R${index + 1}] context_id: ${entry.chunk?.contextId || "(unknown)"}${via}`);
-      pushUnifiedChunkLines(lines, entry.chunk);
-      lines.push("");
+      pushUnifiedChunkLines(lines, entry.chunk, `R${index + 1}`, entry.via?.from || "");
     });
   }
 
   const graph = Array.isArray(result?.graph) ? result.graph : [];
-  if (graph.length) {
-    lines.push("=== GRAPH ===");
-    graph.forEach((path, index) => {
-      if (path.pathSummary) {
-        lines.push(`[P${index + 1}] ${path.pathSummary}`);
-      }
-      const chain = formatPathChain(path);
-      if (chain) {
-        lines.push(`    ${chain}`);
-      }
-    });
+  const facts = graph.flatMap((path, index) => formatUnifiedPath(path, index));
+  if (facts.length) {
+    lines.push("## Related facts", "", ...facts);
   }
 
   return lines.join("\n").trim();
 }
 
 // What the model sees for a unified recall: the server-built llm_prompt, as it
-// came. It carries the citation labels ([1], [R1], [P1]) the model is told to
-// cite, so it is never re-formatted here; the only touches are the secret
+// came. It is markdown and numbers what the model is told to cite (results
+// `### 1.`, forceful relations `### R1.`, related facts `[P1]`, cited in
+// brackets as [1] / [R1] / [P1]), so it is never re-formatted here; the only touches are the secret
 // redaction applied at normalisation and the block budget below. The
 // structured rendering is used only if a server sent no prompt at all, so a
 // result is never silently dropped.

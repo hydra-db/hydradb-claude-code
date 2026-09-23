@@ -30,6 +30,9 @@ vocabulary and does not diverge from the other clients or from the pinned SDK.
     pinned byte-for-byte against goldens cut from the pre-contract code.
 - **`fixtures.mjs`**: the split (v2) and unified (four-key) query responses
   the wire tests and goldens share.
+- **`unified-query-envelope.json`**: a real unified `/query` envelope as the
+  server's own handler test renders it (enrichment string, `enrichment_kind`,
+  markdown `llm_prompt`), read end to end by a wire test.
 - **`golden/`**: committed key-shape snapshots plus the two whole-text split
   goldens. Regenerate intentionally with `UPDATE_GOLDEN=1 npm run check` and
   review the diff; a change to a `split-*` golden is a split regression.
