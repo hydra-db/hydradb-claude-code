@@ -23,7 +23,7 @@ The plugin gives Claude Code persistent, cross-session memory powered by [HydraD
 ## Quick Start
 
 ```bash
-git clone https://github.com/usecortex/hydradb-claude-code.git
+git clone https://github.com/hydra-db/hydradb-claude-code.git
 cd hydradb-claude-code
 make bootstrap
 ```
@@ -52,7 +52,7 @@ Install the plugin in Claude Code:
 Or, once the repo is public:
 
 ```
-/plugin marketplace add usecortex/hydradb-claude-code
+/plugin marketplace add hydra-db/hydradb-claude-code
 /plugin install hydradb@hydradb
 ```
 

@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Questions & Discussion
-    url: https://github.com/usecortex/hydradb-claude-code/discussions
+    url: https://github.com/hydra-db/hydradb-claude-code/discussions
     about: "Ask questions and discuss ideas in GitHub Discussions"
   - name: HydraDB Documentation
     url: https://docs.hydradb.com
