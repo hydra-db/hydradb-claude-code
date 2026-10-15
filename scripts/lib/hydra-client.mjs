@@ -329,11 +329,13 @@ export function normalizeRetrievalResponse(response) {
           sourceTitle: trimText(redactSecrets(extractChunkTitle(chunk)), 120),
           text: trimText(redactSecrets(extractChunkText(chunk))),
           score:
-            typeof chunk?.score === "number"
-              ? chunk.score
-              : typeof chunk?.relevance_score === "number"
-                ? chunk.relevance_score
-                : undefined,
+            typeof chunk?.relevancy_score === "number"
+              ? chunk.relevancy_score
+              : typeof chunk?.score === "number"
+                ? chunk.score
+                : typeof chunk?.relevance_score === "number"
+                  ? chunk.relevance_score
+                  : undefined,
           sourceId: chunk?.source_id || chunk?.id || "",
           chunkUuid: trimText(redactSecrets(extractChunkUuid(chunk)), 120),
           extraContextIds: extractExtraContextIds(chunk).map((entry) =>
