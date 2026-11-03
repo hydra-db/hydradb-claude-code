@@ -6,7 +6,7 @@
 //
 // The vectors are shared and identical across all four client repos; this runner
 // is the plugin's own. Its repo tag is "plugin" — vectors whose `optional_for`
-// names "plugin" are skipped (none do today).
+// names "plugin" are skipped.
 
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -141,17 +141,29 @@ function invokeWrapper(wrapper, op, args) {
       return wrapper.databases.collections({ database: args.database });
     case "database.readiness":
       return wrapper.databases.readiness({ database: args.database });
+    case "database.stats":
+      return wrapper.databases.stats({ database: args.database });
     default:
       throw new Error(`conformance: unmapped op "${op}"`);
   }
 }
 
+// Scalars compare as strings, since multipart fields arrive as text. Objects
+// compare key by key, so a list of objects cannot pass as "[object Object]".
 function valuesMatch(actual, expected) {
   if (Array.isArray(expected)) {
     const actualArr = [].concat(actual);
     return (
       actualArr.length === expected.length &&
-      expected.every((v, i) => String(actualArr[i]) === String(v))
+      expected.every((v, i) => valuesMatch(actualArr[i], v))
+    );
+  }
+  if (expected !== null && typeof expected === "object") {
+    return (
+      actual !== null &&
+      typeof actual === "object" &&
+      Object.keys(actual).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([k, v]) => valuesMatch(actual[k], v))
     );
   }
   return String(actual) === String(expected);
