@@ -6,7 +6,7 @@
 //
 // The vectors are shared and identical across all four client repos; this runner
 // is the plugin's own. Its repo tag is "plugin" — vectors whose `optional_for`
-// names "plugin" are skipped (none do today).
+// names "plugin" are skipped.
 
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -141,6 +141,8 @@ function invokeWrapper(wrapper, op, args) {
       return wrapper.databases.collections({ database: args.database });
     case "database.readiness":
       return wrapper.databases.readiness({ database: args.database });
+    case "database.stats":
+      return wrapper.databases.stats({ database: args.database });
     default:
       throw new Error(`conformance: unmapped op "${op}"`);
   }
