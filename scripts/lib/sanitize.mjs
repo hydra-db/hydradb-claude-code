@@ -68,9 +68,36 @@ export function unwrapAppKnowledgeEnvelope(text) {
     return text;
   }
 
+  // Recall may append graph enrichment after the envelope ("\n\nExtra context:
+  // ..."), so decode only the leading JSON object (string-aware brace scan)
+  // rather than JSON.parse-ing the whole string, which throws on the trailing
+  // text and leaks the raw envelope. The enrichment is kept, the scaffolding dropped.
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  let end = -1;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end === -1) {
+    return text;
+  }
+
   let parsed;
   try {
-    parsed = JSON.parse(trimmed);
+    parsed = JSON.parse(trimmed.slice(0, end));
   } catch {
     return text;
   }
@@ -79,10 +106,11 @@ export function unwrapAppKnowledgeEnvelope(text) {
     return text;
   }
 
+  const trailing = trimmed.slice(end).trim();
   const candidates = [parsed.content, parsed.content?.text, parsed.content?.markdown];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) {
-      return candidate;
+      return trailing ? `${candidate}\n\n${trailing}` : candidate;
     }
   }
 
