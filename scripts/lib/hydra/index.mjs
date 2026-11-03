@@ -239,9 +239,18 @@ export function createHydraWrapper({
         ...(args.recencyBias != null ? { recencyBias: args.recencyBias } : {}),
         ...(args.graphContext != null ? { graphContext: args.graphContext } : {})
       };
-      return unwrapAndNormalize(
-        await call("/query", timeoutMs, () => client.query(request, requestOptions(timeoutMs)))
-      );
+      const includeTableSql = args.includeTableSql ?? args.include_table_sql;
+      const tableLimit = args.tableLimit ?? args.table_limit;
+      if (includeTableSql != null) request.includeTableSql = includeTableSql;
+      if (tableLimit != null) request.tableLimit = tableLimit;
+      // Published SDK 2.1.2 strips these new request fields during serialization.
+      // They will reach the wire after a compatible SDK is released and vendored.
+      const envelope = await call("/query", timeoutMs, () => client.query(request, requestOptions(timeoutMs)));
+      const data = unwrapAndNormalize(envelope);
+      const warnings = snakeCaseKeys(envelope?.meta?.warnings);
+      return warnings != null && data && typeof data === "object" && !Array.isArray(data)
+        ? { ...data, warnings: data.warnings ?? warnings }
+        : data;
     },
 
     async ingest(args = {}, opts = {}) {

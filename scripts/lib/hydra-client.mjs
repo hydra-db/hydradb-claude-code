@@ -120,6 +120,16 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
+// Preserve structured response extensions without bypassing secret redaction.
+function redactStructured(value) {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactStructured);
+  if (value && typeof value === "object") return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, redactStructured(entry)])
+  );
+  return value;
+}
+
 function sanitizeNode(node) {
   if (typeof node === "string") {
     return { name: trimText(redactSecrets(node), 120) };
@@ -130,7 +140,9 @@ function sanitizeNode(node) {
   }
 
   return {
-    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120)
+    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120),
+    ...Object.fromEntries(["database", "collection", "source_id", "read_status"]
+      .filter((key) => node[key] != null).map((key) => [key, redactStructured(node[key])]))
   };
 }
 
@@ -150,6 +162,8 @@ function sanitizeRelation(relation) {
       ),
       80
     ),
+    ...Object.fromEntries(["database", "collection", "source_id", "read_status"]
+      .filter((key) => relation[key] != null).map((key) => [key, redactStructured(relation[key])])),
     context: trimText(redactSecrets(relation.context || relation.description || ""), 180),
     temporal_details: trimText(
       redactSecrets(relation.temporal_details || relation.time || ""),
@@ -336,6 +350,7 @@ export function normalizeRetrievalResponse(response) {
                 : undefined,
           sourceId: chunk?.source_id || chunk?.id || "",
           chunkUuid: trimText(redactSecrets(extractChunkUuid(chunk)), 120),
+          ...(chunk?.chunk_metadata != null ? { chunkMetadata: redactStructured(chunk.chunk_metadata) } : {}),
           extraContextIds: extractExtraContextIds(chunk).map((entry) =>
             trimText(redactSecrets(entry), 120)
           ),
@@ -359,6 +374,9 @@ export function normalizeRetrievalResponse(response) {
 
   return {
     chunks,
+    ...(response?.tabular_data != null ? { tabularData: redactStructured(response.tabular_data) } : {}),
+    ...(response?.temporal_facts != null ? { temporalFacts: redactStructured(response.temporal_facts) } : {}),
+    ...(response?.warnings != null ? { warnings: redactStructured(response.warnings) } : {}),
     queryPaths: extractQueryPaths(response),
     graphContext,
     additionalContext: sanitizeAdditionalContextMap(
@@ -409,7 +427,9 @@ export class HydraClient {
           maxResults: options.maxResults || 6,
           alpha: 0.8,
           recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true
+          graphContext: options.graphContext ?? true,
+          includeTableSql: options.includeTableSql ?? options.include_table_sql,
+          tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
       )
@@ -426,7 +446,9 @@ export class HydraClient {
           maxResults: options.maxResults || 6,
           alpha: 0.8,
           recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true
+          graphContext: options.graphContext ?? true,
+          includeTableSql: options.includeTableSql ?? options.include_table_sql,
+          tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
       )
