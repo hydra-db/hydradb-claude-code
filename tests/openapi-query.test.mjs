@@ -166,3 +166,30 @@ test("table records and agent context redact segmented credentials without erasi
   assert.match(text, /"tokenizer":"cl100k_base"/);
   assert.match(text, /"cookie_policy_enabled":true/);
 });
+
+test("compact legacy credential names are redacted in records and agent context", async () => {
+  const record = { accesstoken: "compact-token-value", clientsecret: "compact-secret-value",
+    dbpassword: "compact-db-value", AUTHPASSWORD: "compact-auth-value", DBPASSWORD: "compact-upper-db-value",
+    token_count: 120, tokenizer: "cl100k_base", tokencount: 121, cookie_policy_enabled: true };
+  const client = new HydraClient({ apiKey: "test", tenantId: "db", fetch: async () =>
+    new Response(JSON.stringify({ success: true, data: { chunks: [], tabular_data: { records: [record] } } }),
+      { status: 200, headers: { "content-type": "application/json" } }) });
+  const result = await client.recallKnowledge("q");
+  const actual = result.tabularData.records[0];
+  for (const key of ["accesstoken", "clientsecret", "dbpassword", "AUTHPASSWORD", "DBPASSWORD"]) {
+    assert.equal(actual[key], "[REDACTED]", key);
+  }
+  assert.equal(actual.token_count, 120);
+  assert.equal(actual.tokenizer, "cl100k_base");
+  assert.equal(actual.tokencount, 121);
+  assert.equal(actual.cookie_policy_enabled, true);
+  const context = buildHydraContextBlock({ query: "q", knowledge: result, maxContextChars: 3000 });
+  for (const key of ["accesstoken", "clientsecret", "dbpassword", "AUTHPASSWORD", "DBPASSWORD"]) {
+    assert.ok(!context.includes(record[key]), key);
+    assert.ok(context.includes(`"${key}":"[REDACTED]"`), key);
+  }
+  assert.match(context, /"token_count":120/);
+  assert.match(context, /"tokenizer":"cl100k_base"/);
+  assert.match(context, /"tokencount":121/);
+  assert.match(context, /"cookie_policy_enabled":true/);
+});

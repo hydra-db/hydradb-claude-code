@@ -120,6 +120,14 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
+// Exact legacy compact aliases preserve support for unsegmented credential
+// names without treating ordinary words such as tokenizer as credentials.
+const compactCredentialAliases = new Set(
+  ["", "access", "refresh", "auth", "authentication", "bearer", "id", "session", "api", "client", "service", "user", "app", "oauth", "db", "database"]
+    .flatMap((prefix) => ["password", "token", "secret", "apikey", "authorization", "cookie", "privatekey"]
+      .flatMap((suffix) => [prefix + suffix, prefix + suffix + "value", prefix + suffix + "header"]))
+);
+
 // Match complete credential words at the end of a property name rather than
 // substrings: token_count and cookie_policy_enabled are metadata, not secrets.
 function isCredentialKey(key) {
@@ -130,7 +138,8 @@ function isCredentialKey(key) {
   if (parts.length > 1 && ["value", "header"].includes(parts.at(-1))) parts.pop();
   const tail = parts.slice(-3).join("_");
   const pair = parts.slice(-2).join("_");
-  return ["password", "secret", "token", "cookie", "authorization", "apikey", "privatekey"].includes(parts.at(-1)) ||
+  return compactCredentialAliases.has(parts.at(-1)) ||
+    ["password", "secret", "token", "cookie", "authorization", "apikey", "privatekey"].includes(parts.at(-1)) ||
     ["api_key", "private_key", "secret_key"].includes(pair) || tail === "secret_access_key";
 }
 
