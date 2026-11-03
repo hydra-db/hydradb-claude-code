@@ -148,12 +148,22 @@ function invokeWrapper(wrapper, op, args) {
   }
 }
 
+// Scalars compare as strings, since multipart fields arrive as text. Objects
+// compare key by key, so a list of objects cannot pass as "[object Object]".
 function valuesMatch(actual, expected) {
   if (Array.isArray(expected)) {
     const actualArr = [].concat(actual);
     return (
       actualArr.length === expected.length &&
-      expected.every((v, i) => String(actualArr[i]) === String(v))
+      expected.every((v, i) => valuesMatch(actualArr[i], v))
+    );
+  }
+  if (expected !== null && typeof expected === "object") {
+    return (
+      actual !== null &&
+      typeof actual === "object" &&
+      Object.keys(actual).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([k, v]) => valuesMatch(actual[k], v))
     );
   }
   return String(actual) === String(expected);
