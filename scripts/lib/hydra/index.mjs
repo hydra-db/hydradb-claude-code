@@ -73,7 +73,9 @@ export function snakeCaseKeys(value) {
     return Object.fromEntries(
       Object.entries(value).map(([key, entry]) => [
         key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase(),
-        snakeCaseKeys(entry)
+        // Metadata is an opaque user map, not an SDK model; its keys can
+        // differ only by casing and must not be normalized recursively.
+        key === "chunkMetadata" || key === "chunk_metadata" ? entry : snakeCaseKeys(entry)
       ])
     );
   }

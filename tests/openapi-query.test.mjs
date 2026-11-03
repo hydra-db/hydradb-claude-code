@@ -39,3 +39,42 @@ test("recall forwards snake_case options through its wrapper", async () => {
   assert.equal(request.includeTableSql, true);
   assert.equal(request.tableLimit, 7);
 });
+
+test("HydraClient preserves metadata keys and redacts sensitive properties", async () => {
+  const metadata = {
+    customerID: "first", customer_id: "second", nestedMap: {
+      customerID: 1, customer_id: 2, password: "short", token: 123,
+      secret: { nested: "hidden" }, api_key: "abc", "API key": "def",
+      authorization: "bearer", cookie: ["session"], private_key: "key",
+      safeText: "password=verylongpassword"
+    }, list: [{ accessToken: "secret value", validKey: "visible" }]
+  };
+  for (const field of ["chunkMetadata", "chunk_metadata"]) {
+    const client = new HydraClient({ sdkClient: { query: async () => ({
+      success: true, data: { chunks: [{ chunkContent: "hello", [field]: metadata }] }
+    }) } });
+    const result = await client.recallKnowledge("q");
+    const actual = result.chunks[0].chunkMetadata;
+    assert.equal(actual.customerID, "first");
+    assert.equal(actual.customer_id, "second");
+    assert.equal(actual.nestedMap.customerID, 1);
+    assert.equal(actual.nestedMap.customer_id, 2);
+    for (const key of ["password", "token", "secret", "api_key", "API key", "authorization", "cookie", "private_key"]) {
+      assert.equal(actual.nestedMap[key], "[REDACTED]");
+    }
+    assert.equal(actual.nestedMap.safeText, "[REDACTED:generic-secret]");
+    assert.deepEqual(actual.list, [{ accessToken: "[REDACTED]", validKey: "visible" }]);
+  }
+});
+
+test("vendored SDK recall retains and redacts wire metadata", async () => {
+  const client = new HydraClient({ apiKey: "test-key", tenantId: "test-db", fetch: async () =>
+    new Response(JSON.stringify({ success: true, data: { chunks: [{
+      chunk_content: "hello", chunk_metadata: { customerID: "one", customer_id: "two", password: "short" }
+    }] } }), { status: 200, headers: { "content-type": "application/json" } })
+  });
+  const result = await client.recallKnowledge("q");
+  assert.deepEqual(result.chunks[0].chunkMetadata, {
+    customerID: "one", customer_id: "two", password: "[REDACTED]"
+  });
+});

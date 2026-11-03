@@ -125,7 +125,12 @@ function redactStructured(value) {
   if (typeof value === "string") return redactSecrets(value);
   if (Array.isArray(value)) return value.map(redactStructured);
   if (value && typeof value === "object") return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => [key, redactStructured(entry)])
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      /password|token|secret|apikey|authorization|cookie|privatekey/i.test(key.replace(/[^a-z0-9]/gi, ""))
+        ? "[REDACTED]"
+        : redactStructured(entry)
+    ])
   );
   return value;
 }

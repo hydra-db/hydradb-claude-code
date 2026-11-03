@@ -38,7 +38,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "check": "node scripts/check.mjs",
+    "check": "node scripts/check.mjs && node --test tests/openapi-query.test.mjs",
     "build:vendor": "node scripts/build-vendor.mjs",
     "pack:dry-run": "npm pack --dry-run"
   },
