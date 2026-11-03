@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { buildHydraContextBlock } from "../scripts/lib/context-format.mjs";
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
 
@@ -43,7 +44,7 @@ test("recall forwards snake_case options through its wrapper", async () => {
 test("HydraClient preserves metadata keys and redacts sensitive properties", async () => {
   const metadata = {
     customerID: "first", customer_id: "second", nestedMap: {
-      customerID: 1, customer_id: 2, password: "short", token: 123,
+      customerID: 1, customer_id: 2, token_count: 120, tokenizer: "cl100k_base", password: "short", token: 123,
       secret: { nested: "hidden" }, api_key: "abc", "API key": "def",
       authorization: "bearer", cookie: ["session"], private_key: "key",
       safeText: "password=verylongpassword"
@@ -59,6 +60,8 @@ test("HydraClient preserves metadata keys and redacts sensitive properties", asy
     assert.equal(actual.customer_id, "second");
     assert.equal(actual.nestedMap.customerID, 1);
     assert.equal(actual.nestedMap.customer_id, 2);
+    assert.equal(actual.nestedMap.token_count, 120);
+    assert.equal(actual.nestedMap.tokenizer, "cl100k_base");
     for (const key of ["password", "token", "secret", "api_key", "API key", "authorization", "cookie", "private_key"]) {
       assert.equal(actual.nestedMap[key], "[REDACTED]");
     }
@@ -77,4 +80,62 @@ test("vendored SDK recall retains and redacts wire metadata", async () => {
   assert.deepEqual(result.chunks[0].chunkMetadata, {
     customerID: "one", customer_id: "two", password: "[REDACTED]"
   });
+});
+
+test("real SDK serializes per-request table options and preserves record keys", async () => {
+  const sent = [];
+  const client = new HydraClient({ apiKey: "test-key", tenantId: "db", fetch: async (url, init) => {
+    sent.push({ url: String(url), init, body: JSON.parse(init.body) });
+    return new Response(JSON.stringify({ success: true, data: { chunks: [],
+      tabular_data: { records: [{ customerID: 1, customer_id: 2, nestedMap: { fieldID: 3, field_id: 4 } }] }
+    } }), { status: 200, headers: { "content-type": "application/json" } });
+  } });
+  const [a, b] = await Promise.all([
+    client.recallKnowledge("a", { include_table_sql: false, table_limit: 0 }),
+    client.recallKnowledge("b", { include_table_sql: true, table_limit: 9 })
+  ]);
+  assert.deepEqual(a.tabularData.records[0], { customerID: 1, customer_id: 2, nestedMap: { fieldID: 3, field_id: 4 } });
+  assert.deepEqual(b.tabularData, a.tabularData);
+  assert.deepEqual(sent.map(x => [x.body.query, x.body.include_table_sql, x.body.table_limit]).sort(), [["a", false, 0], ["b", true, 9]]);
+  assert.ok(sent.every(x => x.init.signal && x.init.method === "POST"));
+  assert.ok(sent.every(x => new Headers(x.init.headers).get("authorization")));
+});
+
+test("agent context includes bounded table and warnings from real recall", async () => {
+  async function recall(data, warnings) {
+    const client = new HydraClient({ apiKey: "test-key", tenantId: "db", fetch: async () =>
+      new Response(JSON.stringify({ success: true, data, meta: { warnings } }), { status: 200, headers: { "content-type": "application/json" } }) });
+    return client.recallKnowledge("q");
+  }
+  const table = { records: [{ customerID: "A", customer_id: "B" }] };
+  for (const data of [{ chunks: [], tabular_data: table }, { chunks: [{ chunk_content: "prose" }], tabular_data: table, llm_prompt: "server prompt" }]) {
+    const result = await recall(data, [{ code: "PARTIAL", message: "incomplete", collections: ["db"] }]);
+    const context = buildHydraContextBlock({ query: "q", knowledge: result, maxContextChars: 3000 });
+    assert.match(context, /customerID/); assert.match(context, /customer_id/);
+    assert.match(context, /PARTIAL/); assert.match(context, /incomplete/);
+    if (data.chunks.length) assert.match(context, /prose|server prompt/);
+  }
+  const warningOnly = await recall({ chunks: [] }, [{ code: "PARTIAL", message: "incomplete" }]);
+  assert.match(buildHydraContextBlock({ query: "q", knowledge: warningOnly, maxContextChars: 3000 }), /PARTIAL/);
+  const huge = await recall({ chunks: [], tabular_data: { records: Array.from({length: 100}, (_, i) => ({ value: "x".repeat(300), i })) } }, []);
+  const context = buildHydraContextBlock({ query: "q", knowledge: huge, maxContextChars: 1200 });
+  assert.ok(context.length <= 1200); assert.match(context, /omitted/i);
+});
+
+test("table bridge preserves SDK error handling and timeout cancellation", async () => {
+  let calls = 0;
+  const failing = new HydraClient({ apiKey: "test", tenantId: "db", fetch: async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ message: "denied" }), { status: 403, headers: { "content-type": "application/json" } });
+  } });
+  await assert.rejects(failing.recallKnowledge("q", { include_table_sql: true }), /403/);
+  assert.equal(calls, 1);
+  let aborted = false;
+  const slow = new HydraClient({ apiKey: "test", tenantId: "db", requestTimeoutMs: 5, fetch: async (_url, init) =>
+    new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => {
+      aborted = true; reject(new DOMException("aborted", "AbortError"));
+    }, { once: true }))
+  });
+  await assert.rejects(slow.recallKnowledge("q", { table_limit: 2 }), /timed out|aborted|timeout/i);
+  assert.equal(aborted, true);
 });

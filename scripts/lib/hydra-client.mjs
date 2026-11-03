@@ -127,7 +127,7 @@ function redactStructured(value) {
   if (value && typeof value === "object") return Object.fromEntries(
     Object.entries(value).map(([key, entry]) => [
       key,
-      /password|token|secret|apikey|authorization|cookie|privatekey/i.test(key.replace(/[^a-z0-9]/gi, ""))
+      /^(?:(?:access|refresh|auth|authentication|bearer|id|session|api|client|service|user|app|oauth|db|database))?(?:password|token|secret|apikey|authorization|cookie|privatekey)(?:value|header)?$/i.test(key.replace(/[^a-z0-9]/gi, ""))
         ? "[REDACTED]"
         : redactStructured(entry)
     ])
