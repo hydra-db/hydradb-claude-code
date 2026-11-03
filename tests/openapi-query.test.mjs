@@ -139,3 +139,30 @@ test("table bridge preserves SDK error handling and timeout cancellation", async
   await assert.rejects(slow.recallKnowledge("q", { table_limit: 2 }), /timed out|aborted|timeout/i);
   assert.equal(aborted, true);
 });
+
+test("table records and agent context redact segmented credentials without erasing metadata", async () => {
+  const record = {
+    admin_password: "p@ss", signing_secret: "signing", aws_secret_access_key: "aws-key",
+    secret_key: "secret-key-value", webhook_secret: "webhook-value",
+    "x-api-key": "header-api-value", personal_access_token: "personal-token-value",
+    dbPrivateKey: { value: "private-value" }, authorization_header: "auth-value", session_cookie: "cookie-value",
+    token_count: 120, tokenizer: "cl100k_base", cookie_policy_enabled: true
+  };
+  const client = new HydraClient({ apiKey: "test", tenantId: "db", fetch: async () =>
+    new Response(JSON.stringify({ success: true, data: { chunks: [], tabular_data: { records: [record] } } }),
+      { status: 200, headers: { "content-type": "application/json" } })
+  });
+  const result = await client.recallKnowledge("q");
+  const actual = result.tabularData.records[0];
+  for (const key of ["admin_password", "signing_secret", "aws_secret_access_key", "secret_key", "webhook_secret", "x-api-key", "personal_access_token", "dbPrivateKey", "authorization_header", "session_cookie"]) {
+    assert.equal(actual[key], "[REDACTED]", key);
+  }
+  assert.equal(actual.token_count, 120);
+  assert.equal(actual.tokenizer, "cl100k_base");
+  assert.equal(actual.cookie_policy_enabled, true);
+  const text = buildHydraContextBlock({ query: "q", knowledge: result, maxContextChars: 3000 });
+  for (const secret of ["p@ss", "signing\"", "aws-key", "secret-key-value", "webhook-value", "header-api-value", "personal-token-value", "private-value", "auth-value", "cookie-value"]) assert.ok(!text.includes(secret), secret);
+  assert.match(text, /"token_count":120/);
+  assert.match(text, /"tokenizer":"cl100k_base"/);
+  assert.match(text, /"cookie_policy_enabled":true/);
+});

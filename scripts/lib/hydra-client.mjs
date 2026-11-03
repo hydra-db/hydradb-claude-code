@@ -120,6 +120,20 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
+// Match complete credential words at the end of a property name rather than
+// substrings: token_count and cookie_policy_enabled are metadata, not secrets.
+function isCredentialKey(key) {
+  const parts = key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (parts.length > 1 && ["value", "header"].includes(parts.at(-1))) parts.pop();
+  const tail = parts.slice(-3).join("_");
+  const pair = parts.slice(-2).join("_");
+  return ["password", "secret", "token", "cookie", "authorization", "apikey", "privatekey"].includes(parts.at(-1)) ||
+    ["api_key", "private_key", "secret_key"].includes(pair) || tail === "secret_access_key";
+}
+
 // Preserve structured response extensions without bypassing secret redaction.
 function redactStructured(value) {
   if (typeof value === "string") return redactSecrets(value);
@@ -127,7 +141,7 @@ function redactStructured(value) {
   if (value && typeof value === "object") return Object.fromEntries(
     Object.entries(value).map(([key, entry]) => [
       key,
-      /^(?:(?:access|refresh|auth|authentication|bearer|id|session|api|client|service|user|app|oauth|db|database))?(?:password|token|secret|apikey|authorization|cookie|privatekey)(?:value|header)?$/i.test(key.replace(/[^a-z0-9]/gi, ""))
+      isCredentialKey(key)
         ? "[REDACTED]"
         : redactStructured(entry)
     ])
