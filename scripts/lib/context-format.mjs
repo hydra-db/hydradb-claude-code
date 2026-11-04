@@ -150,8 +150,17 @@ export function buildContextString(label, result) {
   return lines.join("\n").trim();
 }
 
-export function buildHydraContextBlock({ query, memory, knowledge, errors, maxContextChars }) {
+export function buildHydraContextBlock({ query, unified, memory, knowledge, errors, maxContextChars }) {
   const sections = [];
+
+  // PRO-1618: a unified database answers with one ranked list, rendered as a
+  // single CONTEXT section rather than a MEMORY/KNOWLEDGE split.
+  if (unified?.chunks?.length || unified?.queryPaths?.length || unified?.graphContext?.queryPathsDetailed?.length) {
+    const section = buildSection("CONTEXT", unified);
+    if (section) {
+      sections.push(section);
+    }
+  }
 
   if (memory?.chunks?.length || memory?.queryPaths?.length || memory?.graphContext?.queryPathsDetailed?.length) {
     const section = buildContextString("MEMORY", memory);

@@ -98,7 +98,7 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `autoRecall` | `true` | Automatically recall HydraDB context on each user prompt |
 | `autoIngest` | `true` | Automatically sync workspace docs on session start |
 | `captureMode` | `session-upsert` | `turn`, `session-upsert`, `both`, or `off` |
-| `searchMode` | `memory` | `memory`, `knowledge`, or `both` |
+| `searchMode` | `memory` | `memory`, `knowledge`, `both`, `unified`, or `auto`. On a database created with `type: "unified"` the plugin detects the layout and always recalls one ranked list (see `hydradb-api-info/unified-databases.md`) |
 | `ingestionMode` | `memory` | `memory`, `knowledge`, or `auto` |
 | `recallMode` | `thinking` | Recall strategy passed to HydraDB |
 | `graphContext` | `true` | Include graph entity paths and relations in recall |

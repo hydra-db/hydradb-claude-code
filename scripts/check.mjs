@@ -8,7 +8,7 @@ import path from "node:path";
 
 import { runConformance } from "../conformance/runner.mjs";
 import { runGoldenTests, runHttpTests } from "../conformance/tests.mjs";
-import { normalizeRetrievalResponse } from "./lib/hydra-client.mjs";
+import { appKnowledgeToItem, memoryToItem, normalizeRetrievalResponse } from "./lib/hydra-client.mjs";
 import { syncWorkspace } from "./lib/workspace-sync.mjs";
 
 const root = process.cwd();
@@ -104,6 +104,38 @@ const plainRecall = normalizeRetrievalResponse({
   chunks: [{ chunk_uuid: "chunk-3", source_title: "n.md", chunk_content: '{"content": not json' }]
 });
 assert.equal(plainRecall.chunks[0].text, '{"content": not json');
+
+// PRO-1618: the unified item mapping. A unified database refuses the split-era
+// `memories`/`app_knowledge` fields, so every write the plugin makes has to
+// survive translation into items[] with nothing dropped.
+assert.deepEqual(
+  memoryToItem({
+    user_assistant_pairs: [{ user: "I prefer dark mode", assistant: "Noted" }],
+    infer: true,
+    user_name: "Ada",
+    custom_instructions: "focus",
+    source_id: "claude-turn:1",
+    tenant_metadata: JSON.stringify({ topic: "ui" })
+  }),
+  {
+    conversation: [
+      { role: "user", content: "I prefer dark mode", name: "Ada" },
+      { role: "assistant", content: "Noted" }
+    ],
+    context_id: "claude-turn:1",
+    enrich: true,
+    custom_instructions: "focus",
+    attributes: { topic: "ui" }
+  }
+);
+assert.deepEqual(memoryToItem({ text: "note", infer: false, custom_instructions: "ignored" }), {
+  text: "note",
+  enrich: false
+});
+assert.deepEqual(
+  appKnowledgeToItem({ id: "claude-file:abc", title: "CLAUDE.md", content: { text: "# Smoke" } }),
+  { text: "# Smoke", enrich: true, context_id: "claude-file:abc", title: "CLAUDE.md" }
+);
 
 const tempDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-plugin-check-"));
 const baseEnv = {

@@ -423,14 +423,14 @@ export async function loadConfig(cwd, dataDir) {
       DEFAULTS.searchMode,
       errors,
       "searchMode",
-      ["memory", "both", "knowledge"]
+      ["memory", "both", "knowledge", "unified", "auto"]
     ),
     ingestionMode: parseMode(
       merged.ingestionMode,
       DEFAULTS.ingestionMode,
       errors,
       "ingestionMode",
-      ["memory", "knowledge", "auto"]
+      ["memory", "knowledge", "auto", "unified"]
     ),
     recallMode: merged.recallMode === "thinking" ? "thinking" : "fast",
     graphContext: parseBoolean(merged.graphContext, DEFAULTS.graphContext, errors, "graphContext"),

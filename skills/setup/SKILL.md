@@ -64,7 +64,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/plugin.mjs" doctor
 
 10. If the user wants whole-session upsert behavior, set `captureMode` to `session-upsert`. If they want both isolated turns and rolling session memories, set it to `both`.
 
-11. The default workspace sync target should usually be `ingestionMode: "memory"`, with markdown-first `includeGlobs`. Only recommend `knowledge` or `both` recall if the user understands the tradeoff.
+11. The default workspace sync target should usually be `ingestionMode: "memory"`, with markdown-first `includeGlobs`. Only recommend `knowledge` or `both` recall if the user understands the tradeoff. If the database was created with `type: "unified"` (one corpus), tell the user the mode knobs do not apply: the plugin detects the layout and sends everything as unified `items[]`.
 
 12. If HydraDB feels slow or the user wants tighter hook budgets, suggest lowering `requestTimeoutMs` and `writeTimeoutMs`, or setting `HYDRADB_REQUEST_TIMEOUT_MS` and `HYDRADB_WRITE_TIMEOUT_MS`.
 

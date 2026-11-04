@@ -367,6 +367,164 @@ export function normalizeRetrievalResponse(response) {
   };
 }
 
+// PRO-1618: the server's machine-readable code for a `type` the addressed
+// database does not accept (hydradb-application #870, handler/errors.go). It
+// names the FAMILY, not the member: the same code covers knowledge/memory on a
+// unified database, `unified` on a split one, and `all` on an ingest. Only the
+// first of those is ours to retry, so the code narrows and the message decides.
+export const CORPUS_TYPE_UNSUPPORTED_CODE = "CORPUS_TYPE_UNSUPPORTED";
+
+// The siblings under that code, excluded FIRST — before the code is consulted,
+// which is the whole reason the order matters. One code now covers five
+// refusals and they do not all point the same way:
+//
+//   `unified` on a split database        only valid on a unified database
+//   context_category on a split database only supported on a unified database
+//   a `type` outside the vocabulary      invalid type "momory": must be …
+//   `all` on an ingest                   invalid type 'all': …
+//   items[] sent with type=knowledge     items cannot be combined with …
+//
+// Retrying any of them as unified turns a clear 400 into a second, more
+// confusing one, and pinning the layout off one would strand a SPLIT database
+// on `unified` for the life of the process. The `all` refusal matters most
+// here: its advice clause is now layout-aware and says "This database is
+// unified, so send 'unified'…", so excluding on `invalid type` before reading
+// the code is what stops that sentence being read as a layout answer.
+const OTHER_CORPUS_REFUSAL_RE =
+  /only valid on a unified database|only supported on a unified database|invalid type|items cannot be combined with/i;
+
+// The wording of the refusal that IS ours, for a server that sends no code (an
+// older build, a proxy that ate the envelope). Two validators answer it:
+//
+//   corpus type validator: `type "memory" is not valid on a unified database: …`
+//   ingest body validator: `this database is unified: send the content as …`
+//
+// The server treats this text as a contract precisely because clients match on
+// it, so it stays as the fallback rather than being deleted once the code ships.
+const UNIFIED_LAYOUT_REFUSAL_RE = /is not valid on a unified database|this database is unified/i;
+
+// Whether an error is the server refusing a split-era `type` on a unified
+// database. Exported so the conformance tests pin every branch.
+export function isUnifiedLayoutRefusal(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (OTHER_CORPUS_REFUSAL_RE.test(message)) {
+    return false;
+  }
+  if (error?.errorCode === CORPUS_TYPE_UNSUPPORTED_CODE) {
+    return true;
+  }
+  return UNIFIED_LAYOUT_REFUSAL_RE.test(message);
+}
+
+// PRO-1618: the unified item shape. One memory-shaped record becomes one item
+// (text or a role/content conversation); the field names are the ones the
+// redesign settled on. Exported so the check script can pin the mapping.
+//
+// `is_markdown` and `user_name` are carried, not dropped: `is_markdown` changes
+// how the server chunks and renders the body and `user_name` is the
+// attribution, so losing either would make the same file ingest differently
+// depending on the database's layout with nothing in the output to say so.
+// MemoryItem has always had both; items[] gained them in hydradb-application
+// #870.
+export function memoryToItem(memory) {
+  const item = {};
+  const conversation = Array.isArray(memory.user_assistant_pairs)
+    ? memory.user_assistant_pairs
+    : null;
+  if (memory.text != null) {
+    item.text = memory.text;
+  }
+  if (conversation) {
+    // `name` is the per-turn speaker identity on IngestItem.conversation — the
+    // one place the server accepts an attribution.
+    item.conversation = conversation.flatMap((pair) => [
+      { role: "user", content: pair.user, ...(memory.user_name ? { name: memory.user_name } : {}) },
+      { role: "assistant", content: pair.assistant }
+    ]);
+  }
+  if (memory.is_markdown != null) {
+    item.is_markdown = memory.is_markdown;
+  }
+  // A conversation's attribution rides on the per-turn `name` above, which is
+  // what the server reads first; only a text item needs the item-level field.
+  if (!conversation && memory.user_name) {
+    item.user_name = memory.user_name;
+  }
+  if (memory.source_id) {
+    item.context_id = memory.source_id;
+  }
+  if (memory.title) {
+    item.title = memory.title;
+  }
+  item.enrich = memory.infer ?? true;
+  if (item.enrich && memory.custom_instructions) {
+    item.custom_instructions = memory.custom_instructions;
+  }
+  if (memory.tenant_metadata != null) {
+    item.attributes = parseMaybeJson(memory.tenant_metadata);
+  }
+  if (memory.document_metadata != null) {
+    item.custom_attributes = parseMaybeJson(memory.document_metadata);
+  }
+  return item;
+}
+
+// A structured app-knowledge record (the workspace sync's knowledge target) as
+// a unified item: the text is the body, the client-assigned id is kept.
+//
+// The field names here are the ones buildKnowledgeItem (workspace-sync.mjs)
+// actually emits — `metadata`/`additional_metadata`, plus source/description/
+// url/timestamp. `tenant_metadata`/`app_metadata` are kept only as aliases for
+// a hand-built record; the producer has never emitted them, so reading only
+// those is what stripped every workspace file down to bare text and a
+// context_id on a unified database while the split lane kept the lot.
+export function appKnowledgeToItem(record) {
+  const item = {
+    text: record?.content?.text ?? record?.text ?? "",
+    enrich: record?.infer ?? true
+  };
+  if (record?.id) {
+    item.context_id = record.id;
+  }
+  if (record?.title) {
+    item.title = record.title;
+  }
+  if (record?.timestamp) {
+    item.happened_at = record.timestamp;
+  }
+  const attributes = record?.metadata ?? record?.tenant_metadata;
+  if (attributes != null) {
+    item.attributes = parseMaybeJson(attributes);
+  }
+  // source/description/url have no field of their own on IngestItem, so they
+  // ride in custom_attributes next to additional_metadata rather than being
+  // dropped — losing the hydradb://workspace/<name>/<path> url is what made a
+  // synced file unattributable on a unified database.
+  const customAttributes = {
+    ...(parseMaybeJson(record?.additional_metadata ?? record?.app_metadata) ?? {})
+  };
+  for (const field of ["source", "description", "url"]) {
+    if (record?.[field] != null) {
+      customAttributes[field] = record[field];
+    }
+  }
+  if (Object.keys(customAttributes).length) {
+    item.custom_attributes = customAttributes;
+  }
+  return item;
+}
+
+function parseMaybeJson(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
+  }
+}
+
 export class HydraClient {
   constructor({
     apiKey,
@@ -399,7 +557,69 @@ export class HydraClient {
     });
   }
 
+  // PRO-1618: whether the configured database keeps one corpus. Resolved once
+  // per process from GET /databases; a failed probe reads as split, so every
+  // existing configuration behaves exactly as before.
+  async isUnified() {
+    if (!this._unifiedPromise) {
+      this._unifiedPromise = this._hydra.databases
+        .layout(this.tenantId)
+        .then((layout) => layout === "unified")
+        .catch(() => false);
+    }
+    return this._unifiedPromise;
+  }
+
+  // The server names the rule when a split kind reaches a unified database.
+  // When the layout probe could not tell (it failed, or the database was not in
+  // the list it saw), that answer IS the layout: run the unified form once and
+  // pin the layout only once that retry has actually succeeded. Pinning first
+  // meant a retry that failed for an unrelated reason (a timeout, a 500) left
+  // the process sending unified for its whole lifetime against a database that
+  // may well be split.
+  async _retryAsUnified(error, retry) {
+    if (isUnifiedLayoutRefusal(error) && !(await this.isUnified())) {
+      const result = await retry();
+      this._unifiedPromise = Promise.resolve(true);
+      return result;
+    }
+    throw error;
+  }
+
+  // One ranked list over everything in a unified database (no corpus selector).
+  async recallUnified(query, options = {}) {
+    return normalizeRetrievalResponse(
+      await this._hydra.context.query(
+        {
+          query,
+          kind: "unified",
+          mode: options.mode || "fast",
+          maxResults: options.maxResults || 6,
+          alpha: 0.8,
+          recencyBias: options.recencyBias ?? 0,
+          graphContext: options.graphContext ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
+      )
+    );
+  }
+
+  async addItems(items, options = {}) {
+    return this._hydra.context.ingest(
+      { items, upsert: options.upsert ?? true },
+      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+    );
+  }
+
   async recallMemories(query, options = {}) {
+    try {
+      return await this._recallMemories(query, options);
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.recallUnified(query, options));
+    }
+  }
+
+  async _recallMemories(query, options = {}) {
     return normalizeRetrievalResponse(
       await this._hydra.context.query(
         {
@@ -417,6 +637,14 @@ export class HydraClient {
   }
 
   async recallKnowledge(query, options = {}) {
+    try {
+      return await this._recallKnowledge(query, options);
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.recallUnified(query, options));
+    }
+  }
+
+  async _recallKnowledge(query, options = {}) {
     return normalizeRetrievalResponse(
       await this._hydra.context.query(
         {
@@ -434,16 +662,25 @@ export class HydraClient {
   }
 
   async addMemories(memories, options = {}) {
+    if (await this.isUnified()) {
+      // A unified database refuses the split-era `memories` field; the same
+      // records go as items[] and land in the one corpus.
+      return this.addItems(memories.map(memoryToItem), options);
+    }
     // The SDK carries memory items as a JSON string in the multipart `memories`
     // field; scope and type=memory are supplied by the wrapper.
-    return this._hydra.context.ingest(
-      {
-        kind: "memory",
-        memories: JSON.stringify(memories),
-        upsert: options.upsert ?? true
-      },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    try {
+      return await this._hydra.context.ingest(
+        {
+          kind: "memory",
+          memories: JSON.stringify(memories),
+          upsert: options.upsert ?? true
+        },
+        { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
+      );
+    } catch (error) {
+      return this._retryAsUnified(error, () => this.addItems(memories.map(memoryToItem), options));
+    }
   }
 
   async addTextMemory(text, options = {}) {
@@ -487,18 +724,51 @@ export class HydraClient {
   }
 
   async uploadKnowledge(appKnowledge) {
+    if (await this.isUnified()) {
+      return this._uploadKnowledgeUnified(appKnowledge);
+    }
     // DX-G-002 fix: knowledge ingests via the SDK's multipart context.ingest,
     // carrying the structured items in `appKnowledge` (a JSON string). That is
     // multipart with a top-level tenant_id and preserves each item's
     // client-assigned `id` verbatim — never the old JSON `{app_knowledge:[…]}`
     // body, and never a v1 `app_sources` field.
-    return this._hydra.context.ingest(
-      {
-        kind: "knowledge",
-        appKnowledge: JSON.stringify(appKnowledge)
-      },
-      { timeoutMs: this.writeTimeoutMs }
-    );
+    try {
+      return await this._hydra.context.ingest(
+        {
+          kind: "knowledge",
+          appKnowledge: JSON.stringify(appKnowledge)
+        },
+        { timeoutMs: this.writeTimeoutMs }
+      );
+    } catch (error) {
+      // The knowledge lane needs the same recovery every other layout-sensitive
+      // call has. Without it one flaky GET /databases pinned the process to
+      // "split" and every knowledge write 400d for the rest of its life, while
+      // the memory-lane files in the very same sync recovered.
+      return this._retryAsUnified(error, () => this._uploadKnowledgeUnified(appKnowledge));
+    }
+  }
+
+  async _uploadKnowledgeUnified(appKnowledge) {
+    const items = [];
+    for (const record of appKnowledge || []) {
+      const item = appKnowledgeToItem(record);
+      // Server validation is per item but all-or-nothing for the request, so a
+      // single empty record would 400 the whole batch — where the split lane
+      // simply stored it. Drop it here, loudly, and let the rest through.
+      if (!item.text || !item.text.trim()) {
+        process.stderr.write(
+          `[hydradb] skipping empty knowledge record ${record?.id || "(no id)"}: a unified ` +
+            "ingest rejects an item with no text, and one would fail the whole batch.\n"
+        );
+        continue;
+      }
+      items.push(item);
+    }
+    if (!items.length) {
+      return { success_count: 0, failed_count: 0 };
+    }
+    return this.addItems(items, { upsert: true });
   }
 
   // Returns { deletedIds, failedIds, data }: which ids the server confirmed
@@ -511,10 +781,13 @@ export class HydraClient {
     if (!ids.length) {
       return { deletedIds: [], failedIds: [] };
     }
-    return this._hydra.context.delete(
-      { ids, kind: "memory" },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    const timeoutMs = options.timeoutMs ?? this.writeTimeoutMs;
+    const kind = (await this.isUnified()) ? "unified" : "memory";
+    try {
+      return await this._hydra.context.delete({ ids, kind }, { timeoutMs });
+    } catch (error) {
+      return this._retryAsUnified(error, () => this._hydra.context.delete({ ids, kind: "unified" }, { timeoutMs }));
+    }
   }
 
   async deleteMemory(memoryId, options = {}) {
@@ -529,10 +802,15 @@ export class HydraClient {
     if (!knowledgeIds.length) {
       return { deletedIds: [], failedIds: [] };
     }
-    return this._hydra.context.delete(
-      { ids: knowledgeIds, kind: "knowledge" },
-      { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
-    );
+    const timeoutMs = options.timeoutMs ?? this.writeTimeoutMs;
+    const kind = (await this.isUnified()) ? "unified" : "knowledge";
+    try {
+      return await this._hydra.context.delete({ ids: knowledgeIds, kind }, { timeoutMs });
+    } catch (error) {
+      return this._retryAsUnified(error, () =>
+        this._hydra.context.delete({ ids: knowledgeIds, kind: "unified" }, { timeoutMs })
+      );
+    }
   }
 }
 
