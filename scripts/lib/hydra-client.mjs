@@ -120,6 +120,44 @@ function extractChunkRelations(chunk) {
     .slice(0, 3);
 }
 
+// Exact legacy compact aliases preserve support for unsegmented credential
+// names without treating ordinary words such as tokenizer as credentials.
+const compactCredentialAliases = new Set(
+  ["", "access", "refresh", "auth", "authentication", "bearer", "id", "session", "api", "client", "service", "user", "app", "oauth", "db", "database"]
+    .flatMap((prefix) => ["password", "token", "secret", "apikey", "authorization", "cookie", "privatekey"]
+      .flatMap((suffix) => [prefix + suffix, prefix + suffix + "value", prefix + suffix + "header"]))
+);
+
+// Match complete credential words at the end of a property name rather than
+// substrings: token_count and cookie_policy_enabled are metadata, not secrets.
+function isCredentialKey(key) {
+  const parts = key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (parts.length > 1 && ["value", "header"].includes(parts.at(-1))) parts.pop();
+  const tail = parts.slice(-3).join("_");
+  const pair = parts.slice(-2).join("_");
+  return compactCredentialAliases.has(parts.at(-1)) ||
+    ["password", "secret", "token", "cookie", "authorization", "apikey", "privatekey"].includes(parts.at(-1)) ||
+    ["api_key", "private_key", "secret_key"].includes(pair) || tail === "secret_access_key";
+}
+
+// Preserve structured response extensions without bypassing secret redaction.
+function redactStructured(value) {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactStructured);
+  if (value && typeof value === "object") return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      isCredentialKey(key)
+        ? "[REDACTED]"
+        : redactStructured(entry)
+    ])
+  );
+  return value;
+}
+
 function sanitizeNode(node) {
   if (typeof node === "string") {
     return { name: trimText(redactSecrets(node), 120) };
@@ -130,7 +168,9 @@ function sanitizeNode(node) {
   }
 
   return {
-    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120)
+    name: trimText(redactSecrets(node.name || node.label || node.id || ""), 120),
+    ...Object.fromEntries(["database", "collection", "source_id", "read_status"]
+      .filter((key) => node[key] != null).map((key) => [key, redactStructured(node[key])]))
   };
 }
 
@@ -150,6 +190,8 @@ function sanitizeRelation(relation) {
       ),
       80
     ),
+    ...Object.fromEntries(["database", "collection", "source_id", "read_status"]
+      .filter((key) => relation[key] != null).map((key) => [key, redactStructured(relation[key])])),
     context: trimText(redactSecrets(relation.context || relation.description || ""), 180),
     temporal_details: trimText(
       redactSecrets(relation.temporal_details || relation.time || ""),
@@ -336,6 +378,7 @@ export function normalizeRetrievalResponse(response) {
                 : undefined,
           sourceId: chunk?.source_id || chunk?.id || "",
           chunkUuid: trimText(redactSecrets(extractChunkUuid(chunk)), 120),
+          ...(chunk?.chunk_metadata != null ? { chunkMetadata: redactStructured(chunk.chunk_metadata) } : {}),
           extraContextIds: extractExtraContextIds(chunk).map((entry) =>
             trimText(redactSecrets(entry), 120)
           ),
@@ -359,10 +402,16 @@ export function normalizeRetrievalResponse(response) {
 
   return {
     chunks,
+    ...(response?.tabular_data != null ? { tabularData: redactStructured(response.tabular_data) } : {}),
+    ...(response?.temporal_facts != null ? { temporalFacts: redactStructured(response.temporal_facts) } : {}),
+    ...(response?.warnings != null ? { warnings: redactStructured(response.warnings) } : {}),
     queryPaths: extractQueryPaths(response),
     graphContext,
     additionalContext: sanitizeAdditionalContextMap(
       response?.additional_context || response?.additionalContext
+    ),
+    llmPrompt: redactSecrets(
+      typeof response?.llm_prompt === "string" ? response.llm_prompt : response?.llmPrompt || ""
     )
   };
 }
@@ -409,7 +458,9 @@ export class HydraClient {
           maxResults: options.maxResults || 6,
           alpha: 0.8,
           recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true
+          graphContext: options.graphContext ?? true,
+          includeTableSql: options.includeTableSql ?? options.include_table_sql,
+          tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
       )
@@ -426,7 +477,9 @@ export class HydraClient {
           maxResults: options.maxResults || 6,
           alpha: 0.8,
           recencyBias: options.recencyBias ?? 0,
-          graphContext: options.graphContext ?? true
+          graphContext: options.graphContext ?? true,
+          includeTableSql: options.includeTableSql ?? options.include_table_sql,
+          tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
       )

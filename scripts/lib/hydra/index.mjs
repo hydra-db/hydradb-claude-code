@@ -65,15 +65,19 @@ function translateError(error, label, timeoutMs) {
 // snake_case wire names. Recursively snake_case object keys so both the delete
 // no-op detection here and the retrieval normalizer (which imports this) can
 // read one spelling. Idempotent on already-snake_case input; values untouched.
-export function snakeCaseKeys(value) {
+export function snakeCaseKeys(value, isTabular = false) {
   if (Array.isArray(value)) {
-    return value.map((entry) => snakeCaseKeys(entry));
+    return value.map((entry) => snakeCaseKeys(entry, isTabular));
   }
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value).map(([key, entry]) => [
         key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase(),
-        snakeCaseKeys(entry)
+        // Metadata is an opaque user map, not an SDK model; its keys can
+        // differ only by casing and must not be normalized recursively.
+        key === "chunkMetadata" || key === "chunk_metadata" || (isTabular && key === "records")
+          ? entry
+          : snakeCaseKeys(entry, key === "tabularData" || key === "tabular_data")
       ])
     );
   }
@@ -239,9 +243,46 @@ export function createHydraWrapper({
         ...(args.recencyBias != null ? { recencyBias: args.recencyBias } : {}),
         ...(args.graphContext != null ? { graphContext: args.graphContext } : {})
       };
-      return unwrapAndNormalize(
-        await call("/query", timeoutMs, () => client.query(request, requestOptions(timeoutMs)))
-      );
+      const includeTableSql = args.includeTableSql ?? args.include_table_sql;
+      const tableLimit = args.tableLimit ?? args.table_limit;
+      if (includeTableSql != null) request.includeTableSql = includeTableSql;
+      if (tableLimit != null) request.tableLimit = tableLimit;
+      // Use a per-call client so concurrent requests cannot share bridge state.
+      // Only the SDK-serialized JSON body is amended; the SDK still owns auth,
+      // response parsing, retries, timeout/abort signals and error translation.
+      let queryClient = client;
+      if (!sdkClient && (includeTableSql != null || tableLimit != null)) {
+        if (includeTableSql != null && typeof includeTableSql !== "boolean") {
+          throw new HydraWrapperError("include_table_sql must be a boolean");
+        }
+        if (tableLimit != null && (!Number.isSafeInteger(tableLimit) || tableLimit < 0)) {
+          throw new HydraWrapperError("table_limit must be a non-negative integer");
+        }
+        const transport = fetchImpl ?? globalThis.fetch;
+        queryClient = new HydraDBClient({
+          token: apiKey,
+          baseUrl: baseUrl.replace(/\/+$/g, ""),
+          maxRetries: MAX_RETRIES,
+          fetch: (url, init) => {
+            if (typeof init?.body !== "string" || init.body.length > 1024 * 1024) {
+              throw new Error("Cannot bridge table options: invalid or oversized SDK query body");
+            }
+            const body = JSON.parse(init.body);
+            if (!body || typeof body !== "object" || Array.isArray(body)) {
+              throw new Error("Cannot bridge table options: invalid SDK query body");
+            }
+            if (includeTableSql != null) body.include_table_sql = includeTableSql;
+            if (tableLimit != null) body.table_limit = tableLimit;
+            return transport(url, { ...init, body: JSON.stringify(body) });
+          }
+        });
+      }
+      const envelope = await call("/query", timeoutMs, () => queryClient.query(request, requestOptions(timeoutMs)));
+      const data = unwrapAndNormalize(envelope);
+      const warnings = snakeCaseKeys(envelope?.meta?.warnings);
+      return warnings != null && data && typeof data === "object" && !Array.isArray(data)
+        ? { ...data, warnings: data.warnings ?? warnings }
+        : data;
     },
 
     async ingest(args = {}, opts = {}) {
