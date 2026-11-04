@@ -8,7 +8,7 @@
     "url": "https://hydradb.com"
   },
   "homepage": "https://docs.hydradb.com/",
-  "repository": "https://github.com/usecortex/hydradb-claude-code",
+  "repository": "https://github.com/hydra-db/hydradb-claude-code",
   "license": "Apache-2.0",
   "keywords": [
     "hydradb",

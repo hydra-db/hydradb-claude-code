@@ -66,7 +66,7 @@ cd hydradb-claude-code
 3. Add the upstream remote:
 
 ```bash
-git remote add upstream https://github.com/usecortex/hydradb-claude-code.git
+git remote add upstream https://github.com/hydra-db/hydradb-claude-code.git
 ```
 
 ### Set up the development environment
@@ -201,9 +201,9 @@ To maintain project quality and protect contributors, the following will not be 
 
 If this is your first contribution, here is how to get started:
 
-1. **Find a good first issue.** Look for issues labeled [`good first issue`](https://github.com/usecortex/hydradb-claude-code/labels/good%20first%20issue) -- these are scoped, well-defined tasks suitable for newcomers.
+1. **Find a good first issue.** Look for issues labeled [`good first issue`](https://github.com/hydra-db/hydradb-claude-code/labels/good%20first%20issue) -- these are scoped, well-defined tasks suitable for newcomers.
 2. **Read the documentation.** The `docs/` directory and skill definitions in `skills/` contain detailed information about the plugin architecture and usage.
-3. **Ask questions.** If anything is unclear, open a thread in [GitHub Discussions](https://github.com/usecortex/hydradb-claude-code/discussions). There are no bad questions.
+3. **Ask questions.** If anything is unclear, open a thread in [GitHub Discussions](https://github.com/hydra-db/hydradb-claude-code/discussions). There are no bad questions.
 
 ---
 
