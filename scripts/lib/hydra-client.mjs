@@ -409,6 +409,9 @@ export function normalizeRetrievalResponse(response) {
     graphContext,
     additionalContext: sanitizeAdditionalContextMap(
       response?.additional_context || response?.additionalContext
+    ),
+    llmPrompt: redactSecrets(
+      typeof response?.llm_prompt === "string" ? response.llm_prompt : response?.llmPrompt || ""
     )
   };
 }

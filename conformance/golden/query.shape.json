@@ -16,6 +16,7 @@
   "knowledge.graphContext.chunkRelations[].triplets[].source.name",
   "knowledge.graphContext.chunkRelations[].triplets[].target.name",
   "knowledge.graphContext.queryPathsDetailed[]",
+  "knowledge.llmPrompt",
   "knowledge.queryPaths[]",
   "memory.additionalContext.x1.chunk_content",
   "memory.additionalContext.x1.source_title",
@@ -33,6 +34,7 @@
   "memory.graphContext.chunkRelations[].triplets[].source.name",
   "memory.graphContext.chunkRelations[].triplets[].target.name",
   "memory.graphContext.queryPathsDetailed[]",
+  "memory.llmPrompt",
   "memory.queryPaths[]",
   "query",
   "searchMode"
