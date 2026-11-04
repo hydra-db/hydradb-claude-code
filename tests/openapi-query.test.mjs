@@ -30,6 +30,30 @@ test("retrieval exposes additive structured fields", () => {
   assert.equal(result.graphContext.queryPathsDetailed[0].triplets[0].source.database, "db");
 });
 
+test("retrieval preserves and safely renders server prompts", () => {
+  const snakeCase = normalizeRetrievalResponse({
+    chunks: [],
+    llm_prompt: "Use this summary with password=verylongpassword"
+  });
+  assert.match(snakeCase.llmPrompt, /Use this summary/);
+  assert.match(snakeCase.llmPrompt, /REDACTED/);
+  assert.ok(!snakeCase.llmPrompt.includes("verylongpassword"));
+
+  const camelCase = normalizeRetrievalResponse({ chunks: [], llmPrompt: "camel prompt" });
+  assert.equal(camelCase.llmPrompt, "camel prompt");
+  assert.equal(normalizeRetrievalResponse({ chunks: [] }).llmPrompt, "");
+  assert.equal(normalizeRetrievalResponse({ chunks: [], llm_prompt: "" }).llmPrompt, "");
+
+  const context = buildHydraContextBlock({
+    query: "q",
+    knowledge: camelCase,
+    maxContextChars: 3000
+  });
+  assert.match(context, /Reference only/);
+  assert.match(context, /=== KNOWLEDGE ===/);
+  assert.match(context, /camel prompt/);
+});
+
 test("recall forwards snake_case options through its wrapper", async () => {
   let request;
   const client = new HydraClient({ sdkClient: { query: async (args) => {
