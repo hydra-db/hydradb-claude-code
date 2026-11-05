@@ -422,19 +422,31 @@ export async function syncWorkspace({
   const memoryFiles = staged.filter((file) => file.target === "memory");
   const knowledgeFiles = staged.filter((file) => file.target === "knowledge");
 
+  const acceptedMemoryIds = new Set();
   const memoryItems = memoryFiles.flatMap((file) => buildMemoryItems(file, projectRoot, config));
   for (const batch of batchMemoryItems(memoryItems, config.maxFileSizeBytes)) {
-    await client.addMemories(batch, {
-      upsert: true,
-      timeoutMs: config.writeTimeoutMs
-    });
+    const { acceptedIds = [], failedIds = [] } =
+      (await client.addMemories(batch, { upsert: true, timeoutMs: config.writeTimeoutMs })) || {};
+    for (const id of acceptedIds) {
+      acceptedMemoryIds.add(id);
+    }
+    for (const id of failedIds) {
+      summary.errors.push(`memory ingest failed for ${id}; retained for retry`);
+    }
   }
 
+  const acceptedKnowledgeIds = new Set();
   for (let index = 0; index < knowledgeFiles.length; index += 5) {
     const batch = knowledgeFiles.slice(index, index + 5).map((file) =>
       buildKnowledgeItem(file, projectRoot, workspaceName)
     );
-    await client.uploadKnowledge(batch);
+    const { acceptedIds = [], failedIds = [] } = (await client.uploadKnowledge(batch)) || {};
+    for (const id of acceptedIds) {
+      acceptedKnowledgeIds.add(id);
+    }
+    for (const id of failedIds) {
+      summary.errors.push(`knowledge ingest failed for ${id}; retained for retry`);
+    }
   }
 
   if (candidatePaths == null) {
@@ -565,6 +577,15 @@ export async function syncWorkspace({
   }
 
   for (const file of staged) {
+    const ids =
+      file.target === "memory"
+        ? memorySourceIds(projectRoot, file.relPath, file.chunkCount)
+        : [fileSourceId(projectRoot, file.relPath)];
+    const acceptedSet = file.target === "memory" ? acceptedMemoryIds : acceptedKnowledgeIds;
+    if (!ids.length || !ids.every((id) => acceptedSet.has(id))) {
+      summary.errors.push(`${file.relPath}: ingest incomplete; retained for retry`);
+      continue;
+    }
     state.files[file.filePath] = {
       digest: file.digest,
       relPath: file.relPath,

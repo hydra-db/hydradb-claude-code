@@ -49,12 +49,12 @@ info "npm install complete"
 
 printf "\n%s\n" "── Configuration ──"
 
-if [ ! -f config.json ]; then
-  cp config.example.json config.json
-  info "Created config.json from config.example.json"
-  warn "Edit config.json and set your HYDRADB_API_KEY and HYDRADB_TENANT_ID."
+if [ ! -f .hydradb-plugin.json ]; then
+  cp config.example.json .hydradb-plugin.json
+  info "Created .hydradb-plugin.json from config.example.json"
+  warn "Edit .hydradb-plugin.json and set your HYDRADB_API_KEY and HYDRADB_TENANT_ID."
 else
-  info "config.json already exists — skipping"
+  info ".hydradb-plugin.json already exists - skipping"
 fi
 
 # ── Syntax check ───────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ echo "  1. Set your HydraDB credentials:"
 echo "       export HYDRADB_API_KEY=\"your-api-key\""
 echo "       export HYDRADB_TENANT_ID=\"your-tenant-id\""
 echo ""
-echo "  2. Or edit config.json directly with your values."
+echo "  2. Or edit .hydradb-plugin.json directly with your values."
 echo ""
 echo "  3. Install the plugin in Claude Code:"
 echo "       /plugin marketplace add /absolute/path/to/hydradb-claude-code"

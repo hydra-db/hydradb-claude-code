@@ -1,4 +1,4 @@
-import { createHydraWrapper } from "./hydra/index.mjs";
+import { createHydraWrapper, classifyIngestion } from "./hydra/index.mjs";
 import { redactSecrets, unwrapAppKnowledgeEnvelope } from "./sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
@@ -435,8 +435,11 @@ export class HydraClient {
 
   async addMemories(memories, options = {}) {
     // The SDK carries memory items as a JSON string in the multipart `memories`
-    // field; scope and type=memory are supplied by the wrapper.
-    return this._hydra.context.ingest(
+    // field; scope and type=memory are supplied by the wrapper. The per-item
+    // outcome is reconciled against each item's source_id so a partially failed
+    // batch is not recorded as fully stored.
+    const requestedIds = (memories || []).map((item) => item.source_id).filter(Boolean);
+    const data = await this._hydra.context.ingest(
       {
         kind: "memory",
         memories: JSON.stringify(memories),
@@ -444,6 +447,7 @@ export class HydraClient {
       },
       { timeoutMs: options.timeoutMs ?? this.writeTimeoutMs }
     );
+    return { ...classifyIngestion(requestedIds, data), data };
   }
 
   async addTextMemory(text, options = {}) {
@@ -492,13 +496,15 @@ export class HydraClient {
     // multipart with a top-level tenant_id and preserves each item's
     // client-assigned `id` verbatim — never the old JSON `{app_knowledge:[…]}`
     // body, and never a v1 `app_sources` field.
-    return this._hydra.context.ingest(
+    const requestedIds = (appKnowledge || []).map((item) => item.id).filter(Boolean);
+    const data = await this._hydra.context.ingest(
       {
         kind: "knowledge",
         appKnowledge: JSON.stringify(appKnowledge)
       },
       { timeoutMs: this.writeTimeoutMs }
     );
+    return { ...classifyIngestion(requestedIds, data), data };
   }
 
   // Returns { deletedIds, failedIds, data }: which ids the server confirmed
