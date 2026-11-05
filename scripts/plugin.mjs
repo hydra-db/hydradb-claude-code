@@ -529,6 +529,11 @@ async function handleStop() {
     savedAt: now
   });
 
+  // Persist the completed exchange before any ingest call: if the API fails the
+  // reply must survive on disk for a later retry, not be lost with the in-memory
+  // state. Capture bookkeeping below is advanced only after a successful send.
+  await writeState(dataDir, state);
+
   const shouldSkipTurnCapture = userPrompt.length < 24 && assistantText.length < 24;
   if (!client || configResult.config.captureMode === "off") {
     await writeState(dataDir, state);
@@ -973,6 +978,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
+  process.stderr.write(`${redactSecrets(error.message)}\n`);
   process.exitCode = 1;
 });

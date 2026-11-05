@@ -299,8 +299,14 @@ await syncWorkspace({
   client: {
     tenantId: "tenant-123",
     subTenantId: "",
-    addMemories: async () => {},
-    uploadKnowledge: async () => {},
+    addMemories: async (batch) => ({
+      acceptedIds: (batch || []).map((item) => item.source_id).filter(Boolean),
+      failedIds: []
+    }),
+    uploadKnowledge: async (batch) => ({
+      acceptedIds: (batch || []).map((item) => item.id).filter(Boolean),
+      failedIds: []
+    }),
     deleteKnowledge: async (ids) => {
       syncCalls.push({ type: "knowledge", ids });
     },

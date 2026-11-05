@@ -24,6 +24,17 @@ const SECRET_PATTERNS = [
   }
 ];
 
+// Configured credential values registered at client construction. A proxy or
+// upstream error can echo the exact key or OAuth token even when its format
+// matches none of the patterns above, so the literal value is stripped by match.
+const registeredSecrets = new Set();
+
+export function registerSecret(value) {
+  if (typeof value === "string" && value.trim().length >= 8) {
+    registeredSecrets.add(value.trim());
+  }
+}
+
 export function normalizeText(text) {
   return String(text || "").replace(/\r\n/g, "\n");
 }
@@ -39,6 +50,10 @@ export function truncateText(text, maxLength) {
 
 export function redactSecrets(text) {
   let redacted = normalizeText(text);
+
+  for (const secret of registeredSecrets) {
+    redacted = redacted.split(secret).join("[REDACTED:credential]");
+  }
 
   for (const { label, regex } of SECRET_PATTERNS) {
     redacted = redacted.replace(regex, `[REDACTED:${label}]`);
