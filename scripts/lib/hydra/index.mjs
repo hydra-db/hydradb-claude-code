@@ -11,6 +11,7 @@
 // budgets, and send API-Version: 2 (the SDK does this).
 
 import { HydraDBClient, HydraDBError, HydraDBTimeoutError } from "../../vendor/hydradb-sdk.mjs";
+import { redactSecrets, registerSecret } from "../sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -54,10 +55,10 @@ function translateError(error, label, timeoutMs) {
   if (error instanceof HydraDBError) {
     const status = error.statusCode != null ? ` with ${error.statusCode}` : "";
     const body = coerceBody(error.body);
-    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`);
+    return new HydraWrapperError(redactSecrets(`${label} failed${status}${body ? `: ${body}` : ""}`));
   }
   const message = error instanceof Error ? error.message : String(error);
-  return new HydraWrapperError(`${label} failed: ${message}`);
+  return new HydraWrapperError(redactSecrets(`${label} failed: ${message}`));
 }
 
 // The SDK deserializes the v2 wire response into camelCase (deletedCount,
@@ -169,6 +170,34 @@ function classifyDeletion(requestedIds, envelope, data) {
   return none;
 }
 
+// Ingestion is PER ITEM: a 200 envelope can still report individual items
+// failed (results[].error / error_code) alongside accepted ones. Given the
+// requested item ids and the seam-normalized response, return which ids the
+// server accepted and which failed, so the caller records only accepted items
+// and retains the rest for retry instead of trusting the batch success flag.
+// Per-item errors are authoritative; absent any, a batch-level failure
+// (success:false or a non-zero failed_count) retains every requested id.
+export function classifyIngestion(requestedIds, data = {}) {
+  const ids = (requestedIds || []).map((id) => String(id));
+  if (!ids.length) {
+    return { acceptedIds: [], failedIds: [] };
+  }
+  const failed = new Set(
+    (Array.isArray(data.results) ? data.results : [])
+      .filter((r) => r && r.id != null && (r.error || r.error_code))
+      .map((r) => String(r.id))
+  );
+  if (!failed.size && (data.success === false || Number(data.failed_count ?? 0) > 0)) {
+    for (const id of ids) {
+      failed.add(id);
+    }
+  }
+  return {
+    acceptedIds: ids.filter((id) => !failed.has(id)),
+    failedIds: ids.filter((id) => failed.has(id))
+  };
+}
+
 export function createHydraWrapper({
   apiKey,
   tenantId,
@@ -180,6 +209,7 @@ export function createHydraWrapper({
   sdkClient,
   fetch: fetchImpl
 } = {}) {
+  registerSecret(apiKey);
   const database = tenantId || "";
   const collection = subTenantId ?? "";
 

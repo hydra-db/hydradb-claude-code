@@ -1,4 +1,5 @@
 .hydradb-plugin-data/
+.hydradb-plugin.json
 .hydradb-plugin.local.json
 config.json
 node_modules/
