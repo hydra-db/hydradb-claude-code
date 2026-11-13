@@ -529,14 +529,12 @@ async function handleStop() {
     savedAt: now
   });
 
-  // Persist the completed exchange before any ingest call: if the API fails the
-  // reply must survive on disk for a later retry, not be lost with the in-memory
-  // state. Capture bookkeeping below is advanced only after a successful send.
+  // Persist the completed exchange before ingest so a failed API call leaves
+  // the reply on disk for retry, not only in memory.
   await writeState(dataDir, state);
 
   const shouldSkipTurnCapture = userPrompt.length < 24 && assistantText.length < 24;
   if (!client || configResult.config.captureMode === "off") {
-    await writeState(dataDir, state);
     return;
   }
 

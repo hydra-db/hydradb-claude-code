@@ -170,13 +170,10 @@ function classifyDeletion(requestedIds, envelope, data) {
   return none;
 }
 
-// Ingestion is PER ITEM: a 200 envelope can still report individual items
-// failed (results[].error / error_code) alongside accepted ones. Given the
-// requested item ids and the seam-normalized response, return which ids the
-// server accepted and which failed, so the caller records only accepted items
-// and retains the rest for retry instead of trusting the batch success flag.
-// Per-item errors are authoritative; absent any, a batch-level failure
-// (success:false or a non-zero failed_count) retains every requested id.
+// Ingestion is PER ITEM: a 200 envelope can report some items failed
+// (results[].status / error / error_code) beside accepted ones. Returns accepted vs
+// failed ids; with no per-item error, a batch failure (success:false or
+// failed_count > 0) fails every requested id.
 export function classifyIngestion(requestedIds, data = {}) {
   const ids = (requestedIds || []).map((id) => String(id));
   if (!ids.length) {
@@ -184,7 +181,7 @@ export function classifyIngestion(requestedIds, data = {}) {
   }
   const failed = new Set(
     (Array.isArray(data.results) ? data.results : [])
-      .filter((r) => r && r.id != null && (r.error || r.error_code))
+      .filter((r) => r && r.id != null && (r.status === "failed" || r.error || r.error_code))
       .map((r) => String(r.id))
   );
   if (!failed.size && (data.success === false || Number(data.failed_count ?? 0) > 0)) {

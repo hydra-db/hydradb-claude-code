@@ -24,9 +24,8 @@ const SECRET_PATTERNS = [
   }
 ];
 
-// Configured credential values registered at client construction. A proxy or
-// upstream error can echo the exact key or OAuth token even when its format
-// matches none of the patterns above, so the literal value is stripped by match.
+// Literal credentials registered at construction and stripped by exact match,
+// covering a key or token the server echoes whose shape fits no pattern above.
 const registeredSecrets = new Set();
 
 export function registerSecret(value) {

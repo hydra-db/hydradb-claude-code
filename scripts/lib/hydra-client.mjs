@@ -434,10 +434,8 @@ export class HydraClient {
   }
 
   async addMemories(memories, options = {}) {
-    // The SDK carries memory items as a JSON string in the multipart `memories`
-    // field; scope and type=memory are supplied by the wrapper. The per-item
-    // outcome is reconciled against each item's source_id so a partially failed
-    // batch is not recorded as fully stored.
+    // Reconcile the per-item outcome against each source_id so a partially
+    // failed batch is not recorded as fully stored.
     const requestedIds = (memories || []).map((item) => item.source_id).filter(Boolean);
     const data = await this._hydra.context.ingest(
       {
