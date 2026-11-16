@@ -181,19 +181,28 @@ export function classifyIngestion(requestedIds, data = {}) {
   if (!ids.length) {
     return { acceptedIds: [], failedIds: [] };
   }
-  const failed = new Set(
-    (Array.isArray(data.results) ? data.results : [])
-      .filter((r) => r && r.id != null && (r.status === "failed" || r.error || r.error_code))
+  const results = Array.isArray(data.results) ? data.results : [];
+  // With no per-item results, fall back to the envelope: accept the batch only
+  // when nothing signals failure, otherwise retry all of it.
+  if (!results.length) {
+    const envelopeOk = data.success !== false && Number(data.failed_count ?? 0) === 0;
+    return envelopeOk
+      ? { acceptedIds: ids, failedIds: [] }
+      : { acceptedIds: [], failedIds: ids };
+  }
+  // With per-item results, accept an id only when a result confirms it without a
+  // failure signal; an id missing from the results is unconfirmed and stays
+  // failed for retry rather than being counted as stored.
+  const confirmed = new Set(
+    results
+      .filter((r) => r && r.id != null && !(r.status === "failed" || r.error || r.error_code))
       .map((r) => String(r.id))
   );
-  if (data.success === false || Number(data.failed_count ?? 0) > failed.size) {
-    for (const id of ids) {
-      failed.add(id);
-    }
-  }
+  const accepted = data.success === false ? [] : ids.filter((id) => confirmed.has(id));
+  const acceptedSet = new Set(accepted);
   return {
-    acceptedIds: ids.filter((id) => !failed.has(id)),
-    failedIds: ids.filter((id) => failed.has(id))
+    acceptedIds: accepted,
+    failedIds: ids.filter((id) => !acceptedSet.has(id))
   };
 }
 

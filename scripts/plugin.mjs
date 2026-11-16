@@ -279,13 +279,26 @@ async function performRecall(client, config, query) {
   };
 }
 
+/**
+ * Throw when an ingest reported items the server did not accept so the caller retries.
+ * @param result object - { acceptedIds, failedIds } from a client ingest call
+ * @param label string - short description used in the thrown message
+ */
+function assertIngestAccepted(result, label) {
+  const failedIds = result && Array.isArray(result.failedIds) ? result.failedIds : [];
+  if (failedIds.length) {
+    throw new Error(`${label}: ${failedIds.length} item(s) not accepted`);
+  }
+}
+
 async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId }) {
-  await client.addConversationMemory(userPrompt, assistantText, {
+  const result = await client.addConversationMemory(userPrompt, assistantText, {
     userName: configResult.config.userName || undefined,
     customInstructions:
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: sourceId || `claude-turn:${sessionId}:${Date.now()}`
   });
+  assertIngestAccepted(result, "conversation capture");
 }
 
 async function autoUpsertSession({ client, configResult, sessionId, session }) {
@@ -295,7 +308,7 @@ async function autoUpsertSession({ client, configResult, sessionId, session }) {
     return false;
   }
 
-  await client.addTextMemory(transcript, {
+  const result = await client.addTextMemory(transcript, {
     infer: true,
     isMarkdown: true,
     title: `Claude Code session ${sessionId}`,
@@ -304,10 +317,53 @@ async function autoUpsertSession({ client, configResult, sessionId, session }) {
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: sessionMemorySourceId(sessionId)
   });
+  assertIngestAccepted(result, "session upsert");
 
   session.lastSessionTranscriptHash = transcriptHash;
   session.lastSessionTranscriptUpdatedAt = new Date().toISOString();
   return true;
+}
+
+const MAX_PENDING_CAPTURES = 50;
+
+/**
+ * Append a turn to the session's retry queue, trimming the oldest past the cap.
+ * @param session object - the per-session state record
+ * @param capture object - the turn to retry later
+ */
+function queuePendingCapture(session, capture) {
+  if (!Array.isArray(session.pendingCaptures)) {
+    session.pendingCaptures = [];
+  }
+  if (session.pendingCapture) {
+    session.pendingCaptures.unshift(session.pendingCapture);
+    session.pendingCapture = null;
+  }
+  session.pendingCaptures.push(capture);
+  if (session.pendingCaptures.length > MAX_PENDING_CAPTURES) {
+    session.pendingCaptures = session.pendingCaptures.slice(-MAX_PENDING_CAPTURES);
+  }
+}
+
+/**
+ * Flush queued turn captures oldest first, stopping at the first that fails.
+ * @param client object - the Hydra client wrapper
+ * @param configResult object - the resolved plugin configuration
+ * @param session object - the per-session state record whose queue drains
+ */
+async function flushPendingCaptures({ client, configResult, session }) {
+  if (!Array.isArray(session.pendingCaptures)) {
+    return;
+  }
+  while (session.pendingCaptures.length) {
+    const pending = session.pendingCaptures[0];
+    await autoCaptureTurn({ client, configResult, ...pending });
+    session.pendingCaptures.shift();
+    if (pending.captureHash) {
+      session.lastCaptureHash = pending.captureHash;
+      session.lastCaptureUpdatedAt = new Date().toISOString();
+    }
+  }
 }
 
 async function handleSessionStart() {
@@ -538,24 +594,25 @@ async function handleStop() {
     return;
   }
 
+  const capturesTurn =
+    configResult.config.captureMode === "turn" || configResult.config.captureMode === "both";
+
+  if (capturesTurn && !shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
+    queuePendingCapture(session, {
+      sessionId,
+      sourceId: `claude-turn:${sessionId}:${Date.now()}`,
+      userPrompt,
+      assistantText,
+      captureHash
+    });
+    // Persist the queued turn before any network call so a stop timeout or a
+    // killed hook still retries it on the next stop.
+    await writeState(dataDir, state);
+  }
+
   try {
-    if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
-      if (session.pendingCapture) {
-        await autoCaptureTurn({ client, configResult, ...session.pendingCapture });
-        session.pendingCapture = null;
-      }
-      if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
-        session.pendingCapture = {
-          sessionId,
-          sourceId: `claude-turn:${sessionId}:${Date.now()}`,
-          userPrompt,
-          assistantText
-        };
-        await autoCaptureTurn({ client, configResult, ...session.pendingCapture });
-        session.lastCaptureHash = captureHash;
-        session.lastCaptureUpdatedAt = new Date().toISOString();
-        session.pendingCapture = null;
-      }
+    if (capturesTurn) {
+      await flushPendingCaptures({ client, configResult, session });
     }
 
     if (
@@ -565,7 +622,7 @@ async function handleStop() {
       await autoUpsertSession({ client, configResult, sessionId, session });
     }
   } catch {
-    // keep session.pendingCapture so the next stop retries the failed ingest
+    // keep the remaining pending captures so the next stop retries them
   }
 
   await writeState(dataDir, state);

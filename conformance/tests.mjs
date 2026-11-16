@@ -11,7 +11,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
+import { classifyIngestion, createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
 import { syncWorkspace } from "../scripts/lib/workspace-sync.mjs";
 
@@ -331,7 +331,100 @@ export async function runHttpTests() {
     assert.equal(inspect.chunk_content, "body");
   }
 
-  return { tests: 9 };
+  // 10) Ingest classification requires an affirmative per-item confirmation. An
+  //     id missing from the results, or one explicitly failed, is unconfirmed and
+  //     stays failed for retry; only a confirmed id is counted as stored. With no
+  //     results at all, the envelope decides the whole batch.
+  {
+    const cases = [
+      ["no results, clean envelope", { success: true }, ["a", "b"], ["a", "b"], []],
+      ["no results, failed_count", { success: true, failed_count: 1 }, ["a"], [], ["a"]],
+      ["no results, success:false", { success: false }, ["a"], [], ["a"]],
+      [
+        "missing result is unconfirmed",
+        { success: true, results: [{ id: "a", status: "completed" }] },
+        ["a", "b"],
+        ["a"],
+        ["b"]
+      ],
+      [
+        "explicit per-item failure",
+        { success: true, results: [{ id: "a", status: "completed" }, { id: "b", status: "failed" }] },
+        ["a", "b"],
+        ["a"],
+        ["b"]
+      ],
+      [
+        "failed_count exceeds identified failures keeps the unseen id pending",
+        { success: true, failed_count: 2, results: [{ id: "a", status: "completed" }, { id: "b", error: "x" }] },
+        ["a", "b", "c"],
+        ["a"],
+        ["b", "c"]
+      ],
+      ["queued counts as accepted", { success: true, results: [{ id: "a", status: "queued" }] }, ["a"], ["a"], []]
+    ];
+    for (const [label, data, ids, expAccepted, expFailed] of cases) {
+      const res = classifyIngestion(ids, data);
+      assert.deepEqual(res.acceptedIds, expAccepted, `acceptedIds for "${label}"`);
+      assert.deepEqual(res.failedIds, expFailed, `failedIds for "${label}"`);
+    }
+  }
+
+  // 11) Partial-ingest rollback persists unconfirmed deletes. A two-chunk memory
+  //     file whose second chunk is rejected must not be tracked, its accepted
+  //     chunk must be deleted, and when that delete does not confirm the id is
+  //     queued in state.pendingDeletes and drained by the next sync.
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-rollback-"));
+    await fs.writeFile(path.join(dir, "NOTE.md"), "alpha bravo charlie delta echo foxtrot golf hotel", "utf8");
+    const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
+    const config = {
+      includeGlobs: ["*.md"],
+      excludeGlobs: [],
+      maxFileSizeBytes: 50 * 1024 * 1024,
+      maxFilesPerSync: 25,
+      maxMemoryCharsPerChunk: 12,
+      maxMemoryChunksPerFile: 10,
+      ingestionMode: "memory",
+      writeTimeoutMs: 15000,
+      userName: "",
+      workspaceMemoryCustomInstructions: ""
+    };
+    let acceptedId = "";
+    let deleteAttempts = 0;
+    let deleteConfirms = false;
+    const client = {
+      tenantId: "db_test",
+      subTenantId: "col_test",
+      addMemories: async (batch) => {
+        acceptedId = batch[0].source_id;
+        return { acceptedIds: [acceptedId], failedIds: batch.slice(1).map((item) => item.source_id) };
+      },
+      uploadKnowledge: async () => ({ acceptedIds: [], failedIds: [] }),
+      deleteMemories: async (ids) => {
+        deleteAttempts += 1;
+        return deleteConfirms
+          ? { deletedIds: ids, failedIds: [] }
+          : { deletedIds: [], failedIds: ids };
+      },
+      deleteKnowledge: async () => ({ deletedIds: [], failedIds: [] })
+    };
+
+    const first = await syncWorkspace({ client, config, projectRoot: dir, workspaceName: "t", state });
+    assert.equal(first.synced, 0, "a partially accepted file must not count as synced");
+    assert.equal(Object.keys(state.files).length, 0, "a partially accepted file must not be tracked");
+    assert.ok(acceptedId, "the first chunk must have been submitted");
+    assert.deepEqual(state.pendingDeletes.memory, [acceptedId], "an unconfirmed rollback delete must be queued");
+    assert.ok(first.errors.some((e) => /ingest incomplete/.test(e)), "the incomplete ingest must be surfaced");
+
+    deleteConfirms = true;
+    const attemptsBefore = deleteAttempts;
+    await syncWorkspace({ client, config, projectRoot: dir, workspaceName: "t", state });
+    assert.ok(deleteAttempts > attemptsBefore, "the next sync must retry the queued delete");
+    assert.deepEqual(state.pendingDeletes.memory, [], "a confirmed retry must clear the queue");
+  }
+
+  return { tests: 11 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────
