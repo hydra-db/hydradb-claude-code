@@ -170,10 +170,12 @@ function classifyDeletion(requestedIds, envelope, data) {
   return none;
 }
 
-// Ingestion is PER ITEM: a 200 envelope can report some items failed
-// (results[].status / error / error_code) beside accepted ones. Returns accepted vs
-// failed ids; with no per-item error, a batch failure (success:false or
-// failed_count > 0) fails every requested id.
+/**
+ * Split requested ids into accepted and failed from the per-item ingest results.
+ * @param requestedIds string[] - ids submitted in this batch
+ * @param data object - normalized ingest response envelope
+ * @return object - { acceptedIds, failedIds }; unconfirmed items stay failed for retry
+ */
 export function classifyIngestion(requestedIds, data = {}) {
   const ids = (requestedIds || []).map((id) => String(id));
   if (!ids.length) {
@@ -184,7 +186,7 @@ export function classifyIngestion(requestedIds, data = {}) {
       .filter((r) => r && r.id != null && (r.status === "failed" || r.error || r.error_code))
       .map((r) => String(r.id))
   );
-  if (!failed.size && (data.success === false || Number(data.failed_count ?? 0) > 0)) {
+  if (data.success === false || Number(data.failed_count ?? 0) > failed.size) {
     for (const id of ids) {
       failed.add(id);
     }

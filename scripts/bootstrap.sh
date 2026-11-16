@@ -52,7 +52,7 @@ printf "\n%s\n" "── Configuration ──"
 if [ ! -f .hydradb-plugin.json ]; then
   cp config.example.json .hydradb-plugin.json
   info "Created .hydradb-plugin.json from config.example.json"
-  warn "Edit .hydradb-plugin.json and set your HYDRADB_API_KEY and HYDRADB_TENANT_ID."
+  warn "Set HYDRADB_API_KEY and HYDRADB_TENANT_ID in your environment, or copy .hydradb-plugin.json into each workspace you open."
 else
   info ".hydradb-plugin.json already exists - skipping"
 fi
@@ -64,7 +64,7 @@ printf "\n%s\n" "── Running syntax check ──"
 if npm run check; then
   info "Syntax check passed"
 else
-  warn "Syntax check had issues — review errors above"
+  warn "Syntax check had issues - review errors above"
 fi
 
 # ── Next steps ─────────────────────────────────────────────────────────────────

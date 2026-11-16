@@ -279,12 +279,12 @@ async function performRecall(client, config, query) {
   };
 }
 
-async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText }) {
+async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId }) {
   await client.addConversationMemory(userPrompt, assistantText, {
     userName: configResult.config.userName || undefined,
     customInstructions:
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
-    sourceId: `claude-turn:${sessionId}:${Date.now()}`
+    sourceId: sourceId || `claude-turn:${sessionId}:${Date.now()}`
   });
 }
 
@@ -538,19 +538,34 @@ async function handleStop() {
     return;
   }
 
-  if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
-    if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
-      await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText });
-      session.lastCaptureHash = captureHash;
-      session.lastCaptureUpdatedAt = new Date().toISOString();
+  try {
+    if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
+      if (session.pendingCapture) {
+        await autoCaptureTurn({ client, configResult, ...session.pendingCapture });
+        session.pendingCapture = null;
+      }
+      if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
+        session.pendingCapture = {
+          sessionId,
+          sourceId: `claude-turn:${sessionId}:${Date.now()}`,
+          userPrompt,
+          assistantText
+        };
+        await autoCaptureTurn({ client, configResult, ...session.pendingCapture });
+        session.lastCaptureHash = captureHash;
+        session.lastCaptureUpdatedAt = new Date().toISOString();
+        session.pendingCapture = null;
+      }
     }
-  }
 
-  if (
-    configResult.config.captureMode === "session-upsert" ||
-    configResult.config.captureMode === "both"
-  ) {
-    await autoUpsertSession({ client, configResult, sessionId, session });
+    if (
+      configResult.config.captureMode === "session-upsert" ||
+      configResult.config.captureMode === "both"
+    ) {
+      await autoUpsertSession({ client, configResult, sessionId, session });
+    }
+  } catch {
+    // keep session.pendingCapture so the next stop retries the failed ingest
   }
 
   await writeState(dataDir, state);

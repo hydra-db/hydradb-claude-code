@@ -576,14 +576,21 @@ export async function syncWorkspace({
     }
   }
 
+  const rollbackMemoryIds = [];
+  const rollbackKnowledgeIds = [];
   for (const file of staged) {
     const ids =
       file.target === "memory"
         ? memorySourceIds(projectRoot, file.relPath, file.chunkCount)
         : [fileSourceId(projectRoot, file.relPath)];
     const acceptedSet = file.target === "memory" ? acceptedMemoryIds : acceptedKnowledgeIds;
-    if (!ids.length || !ids.every((id) => acceptedSet.has(id))) {
+    const acceptedHere = ids.filter((id) => acceptedSet.has(id));
+    if (!ids.length || acceptedHere.length !== ids.length) {
       summary.errors.push(`${file.relPath}: ingest incomplete; retained for retry`);
+      if (acceptedHere.length) {
+        const sink = file.target === "memory" ? rollbackMemoryIds : rollbackKnowledgeIds;
+        sink.push(...acceptedHere);
+      }
       continue;
     }
     state.files[file.filePath] = {
@@ -596,6 +603,23 @@ export async function syncWorkspace({
     summary.synced += 1;
     summary.syncedFiles.push({ path: file.relPath, target: file.target });
     summary.syncedAs[file.target] += 1;
+  }
+
+  // Roll back a partially accepted file so its stored chunks cannot outlive the
+  // untracked file and leak on a later delete; the whole file retries next sync.
+  if (rollbackMemoryIds.length) {
+    try {
+      await client.deleteMemories(rollbackMemoryIds, { timeoutMs: config.writeTimeoutMs });
+    } catch (error) {
+      summary.errors.push(`memory rollback failed: ${error.message}`);
+    }
+  }
+  if (rollbackKnowledgeIds.length) {
+    try {
+      await client.deleteKnowledge(rollbackKnowledgeIds, { timeoutMs: config.writeTimeoutMs });
+    } catch (error) {
+      summary.errors.push(`knowledge rollback failed: ${error.message}`);
+    }
   }
 
   return summary;

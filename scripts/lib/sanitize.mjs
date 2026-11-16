@@ -29,7 +29,7 @@ const SECRET_PATTERNS = [
 const registeredSecrets = new Set();
 
 export function registerSecret(value) {
-  if (typeof value === "string" && value.trim().length >= 8) {
+  if (typeof value === "string" && value.trim().length > 0) {
     registeredSecrets.add(value.trim());
   }
 }
