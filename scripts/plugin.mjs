@@ -345,8 +345,6 @@ function queuePendingCapture(session, capture) {
   }
 }
 
-const MAX_CAPTURE_ATTEMPTS = 5;
-
 /**
  * Flush queued turn captures oldest first, keeping failures so a stuck turn never blocks newer replies.
  * @param client object - the Hydra client wrapper
@@ -366,10 +364,9 @@ async function flushPendingCaptures({ client, configResult, session }) {
         session.lastCaptureUpdatedAt = new Date().toISOString();
       }
     } catch {
-      const attempts = (pending.attempts || 0) + 1;
-      if (attempts < MAX_CAPTURE_ATTEMPTS) {
-        remaining.push({ ...pending, attempts });
-      }
+      // Keep the turn queued so a transient failure retries on a later stop; the
+      // queue is bounded by MAX_PENDING_CAPTURES, which evicts the oldest turns.
+      remaining.push(pending);
     }
   }
   session.pendingCaptures = remaining;
