@@ -424,7 +424,60 @@ export async function runHttpTests() {
     assert.deepEqual(state.pendingDeletes.memory, [], "a confirmed retry must clear the queue");
   }
 
-  return { tests: 11 };
+  // 12) A queued rollback delete must never remove a chunk a later retry
+  //     re-created. A file partially accepted (delete unconfirmed, so its chunk
+  //     is queued) then fully accepted on retry must be tracked, and its now-live
+  //     chunk must be dropped from the queue without being deleted.
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-live-"));
+    await fs.writeFile(path.join(dir, "DOC.md"), "alpha bravo charlie delta echo foxtrot golf hotel", "utf8");
+    const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
+    const config = {
+      includeGlobs: ["*.md"],
+      excludeGlobs: [],
+      maxFileSizeBytes: 50 * 1024 * 1024,
+      maxFilesPerSync: 25,
+      maxMemoryCharsPerChunk: 12,
+      maxMemoryChunksPerFile: 10,
+      ingestionMode: "memory",
+      writeTimeoutMs: 15000,
+      userName: "",
+      workspaceMemoryCustomInstructions: ""
+    };
+    let acceptAll = false;
+    const deletedCalls = [];
+    const client = {
+      tenantId: "db_test",
+      subTenantId: "col_test",
+      addMemories: async (batch) => {
+        const ids = batch.map((item) => item.source_id);
+        return acceptAll
+          ? { acceptedIds: ids, failedIds: [] }
+          : { acceptedIds: ids.slice(0, 1), failedIds: ids.slice(1) };
+      },
+      uploadKnowledge: async () => ({ acceptedIds: [], failedIds: [] }),
+      deleteMemories: async (ids) => {
+        deletedCalls.push(ids);
+        return { deletedIds: [], failedIds: ids }; // never confirms, so it stays queued
+      },
+      deleteKnowledge: async () => ({ deletedIds: [], failedIds: [] })
+    };
+
+    await syncWorkspace({ client, config, projectRoot: dir, workspaceName: "t", state });
+    assert.equal(Object.keys(state.files).length, 0, "the partial file must not be tracked yet");
+    assert.equal(state.pendingDeletes.memory.length, 1, "the unconfirmed rollback chunk must be queued");
+    const queuedId = state.pendingDeletes.memory[0];
+
+    acceptAll = true;
+    const callsBefore = deletedCalls.length;
+    await syncWorkspace({ client, config, projectRoot: dir, workspaceName: "t", state });
+    const newlyDeleted = deletedCalls.slice(callsBefore).flat();
+    assert.ok(state.files[path.join(dir, "DOC.md")], "the fully retried file must be tracked");
+    assert.ok(!newlyDeleted.includes(queuedId), "a chunk the retry re-created must not be deleted");
+    assert.deepEqual(state.pendingDeletes.memory, [], "the re-created chunk must be dropped from the queue");
+  }
+
+  return { tests: 12 };
 }
 
 // ── Golden --json shape snapshots ───────────────────────────────────────────

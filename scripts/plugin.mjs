@@ -345,25 +345,34 @@ function queuePendingCapture(session, capture) {
   }
 }
 
+const MAX_CAPTURE_ATTEMPTS = 5;
+
 /**
- * Flush queued turn captures oldest first, stopping at the first that fails.
+ * Flush queued turn captures oldest first, keeping failures so a stuck turn never blocks newer replies.
  * @param client object - the Hydra client wrapper
  * @param configResult object - the resolved plugin configuration
  * @param session object - the per-session state record whose queue drains
  */
 async function flushPendingCaptures({ client, configResult, session }) {
-  if (!Array.isArray(session.pendingCaptures)) {
+  if (!Array.isArray(session.pendingCaptures) || !session.pendingCaptures.length) {
     return;
   }
-  while (session.pendingCaptures.length) {
-    const pending = session.pendingCaptures[0];
-    await autoCaptureTurn({ client, configResult, ...pending });
-    session.pendingCaptures.shift();
-    if (pending.captureHash) {
-      session.lastCaptureHash = pending.captureHash;
-      session.lastCaptureUpdatedAt = new Date().toISOString();
+  const remaining = [];
+  for (const pending of session.pendingCaptures) {
+    try {
+      await autoCaptureTurn({ client, configResult, ...pending });
+      if (pending.captureHash) {
+        session.lastCaptureHash = pending.captureHash;
+        session.lastCaptureUpdatedAt = new Date().toISOString();
+      }
+    } catch {
+      const attempts = (pending.attempts || 0) + 1;
+      if (attempts < MAX_CAPTURE_ATTEMPTS) {
+        remaining.push({ ...pending, attempts });
+      }
     }
   }
+  session.pendingCaptures = remaining;
 }
 
 async function handleSessionStart() {
@@ -775,7 +784,7 @@ async function handleRemember(args) {
     throw new Error("remember content was empty after redaction");
   }
 
-  await runtime.client.addTextMemory(sanitizedText, {
+  const remembered = await runtime.client.addTextMemory(sanitizedText, {
     infer: true,
     isMarkdown: /[#*_`>-]/.test(sanitizedText),
     title: "Claude Code manual memory",
@@ -785,6 +794,7 @@ async function handleRemember(args) {
       DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: `manual-memory:${Date.now()}`
   });
+  assertIngestAccepted(remembered, "remember");
 
   process.stdout.write(
     wasRedacted(text, sanitizedText)
@@ -817,7 +827,7 @@ async function handleSaveSession(args) {
     runtime.configResult.workspaceName
   );
 
-  await runtime.client.addTextMemory(transcript, {
+  const saved = await runtime.client.addTextMemory(transcript, {
     infer: true,
     isMarkdown: true,
     title: `Claude Code session ${sessionId}`,
@@ -827,6 +837,7 @@ async function handleSaveSession(args) {
       DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: sessionMemorySourceId(sessionId)
   });
+  assertIngestAccepted(saved, "save-session");
 
   const payload = {
     sessionId,

@@ -67,7 +67,7 @@ if [ -n "$DATA_DIR" ]; then
     mkdir -p "$DATA_DIR"
     cp config.example.json "$CONFIG_PATH"
     info "Created $CONFIG_PATH (read for every workspace)"
-    warn "Set HYDRADB_API_KEY and HYDRADB_TENANT_ID in your environment, or edit $CONFIG_PATH."
+    warn "Set HYDRADB_API_KEY, HYDRADB_TENANT_ID, and HYDRADB_COLLECTION in your environment, or edit $CONFIG_PATH."
   else
     info "$CONFIG_PATH already exists - skipping"
   fi
@@ -76,7 +76,7 @@ else
   if [ ! -f .hydradb-plugin.json ]; then
     cp config.example.json .hydradb-plugin.json
     info "Created .hydradb-plugin.json from config.example.json"
-    warn "Set HYDRADB_API_KEY and HYDRADB_TENANT_ID in your environment, or copy .hydradb-plugin.json into each workspace you open."
+    warn "Set HYDRADB_API_KEY, HYDRADB_TENANT_ID, and HYDRADB_COLLECTION in your environment, or copy .hydradb-plugin.json into each workspace you open."
   else
     info ".hydradb-plugin.json already exists - skipping"
   fi
@@ -99,6 +99,7 @@ echo ""
 echo "  1. Set your HydraDB credentials:"
 echo "       export HYDRADB_API_KEY=\"your-api-key\""
 echo "       export HYDRADB_TENANT_ID=\"your-tenant-id\""
+echo "       export HYDRADB_COLLECTION=\"\"   # empty uses the default sub-tenant"
 echo ""
 echo "  2. Or edit the config file created above with your values:"
 echo "       ${CONFIG_PATH}"

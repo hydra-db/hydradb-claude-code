@@ -376,29 +376,59 @@ function queuePendingDeletes(state, target, ids) {
 }
 
 /**
- * Retry queued rollback deletes, keeping any the server still does not confirm gone.
+ * Collect the source ids of every currently tracked file, by target.
+ * @param state object - the workspace sync state record
+ * @param projectRoot string - absolute workspace root used to derive ids
+ * @return object - { memory: Set, knowledge: Set } of live source ids
+ */
+function liveSourceIds(state, projectRoot) {
+  const memory = new Set();
+  const knowledge = new Set();
+  for (const previous of Object.values(state.files || {})) {
+    if (!previous || !previous.relPath) continue;
+    if (previous.target === "memory") {
+      for (const id of memorySourceIds(projectRoot, previous.relPath, previous.chunkCount || 1)) {
+        memory.add(id);
+      }
+    } else if (previous.target === "knowledge") {
+      knowledge.add(fileSourceId(projectRoot, previous.relPath));
+    }
+  }
+  return { memory, knowledge };
+}
+
+/**
+ * Retry queued rollback deletes, dropping ids a tracked file now owns and keeping any the server does not confirm gone.
  * @param client object - the Hydra client wrapper
  * @param config object - the resolved plugin configuration
  * @param state object - the workspace sync state record
  * @param summary object - the run summary that collects surfaced errors
+ * @param live object - { memory: Set, knowledge: Set } of ids that must not be deleted
  */
-async function drainPendingDeletes({ client, config, state, summary }) {
+async function drainPendingDeletes({ client, config, state, summary, live }) {
   const pending = pendingDeletesOf(state);
   const targets = [
-    { key: "memory", remove: (ids, opts) => client.deleteMemories(ids, opts) },
-    { key: "knowledge", remove: (ids, opts) => client.deleteKnowledge(ids, opts) }
+    { key: "memory", liveSet: live.memory, remove: (ids, opts) => client.deleteMemories(ids, opts) },
+    { key: "knowledge", liveSet: live.knowledge, remove: (ids, opts) => client.deleteKnowledge(ids, opts) }
   ];
   for (const target of targets) {
-    const ids = pending[target.key];
-    if (!ids.length) continue;
+    // An id a tracked file now owns was re-created by a successful retry; drop it
+    // without deleting so cleanup can never remove a live chunk. Delete only the
+    // ids that stay orphaned.
+    const queued = pending[target.key].filter((id) => !target.liveSet.has(id));
+    if (!queued.length) {
+      pending[target.key] = [];
+      continue;
+    }
     try {
-      const result = await target.remove([...ids], { timeoutMs: config.writeTimeoutMs });
+      const result = await target.remove([...queued], { timeoutMs: config.writeTimeoutMs });
       const deleted = new Set(result?.deletedIds || []);
-      pending[target.key] = ids.filter((id) => !deleted.has(id));
+      pending[target.key] = queued.filter((id) => !deleted.has(id));
       if (pending[target.key].length) {
         summary.errors.push(`${target.key} rollback pending for ${pending[target.key].length} chunk(s); retained for retry`);
       }
     } catch (error) {
+      pending[target.key] = queued;
       summary.errors.push(`${target.key} rollback retry failed: ${error.message}`);
     }
   }
@@ -428,9 +458,6 @@ export async function syncWorkspace({
       knowledge: 0
     }
   };
-
-  // Clear any chunks a previous rollback could not delete before staging new work.
-  await drainPendingDeletes({ client, config, state, summary });
 
   const staged = [];
   const scannedPaths = new Set();
@@ -668,6 +695,16 @@ export async function syncWorkspace({
     summary.syncedFiles.push({ path: file.relPath, target: file.target });
     summary.syncedAs[file.target] += 1;
   }
+
+  // Retry rollback deletes carried over from earlier runs now that tracking is
+  // final, so an id a completed retry re-created is dropped instead of deleted.
+  await drainPendingDeletes({
+    client,
+    config,
+    state,
+    summary,
+    live: liveSourceIds(state, projectRoot)
+  });
 
   // Roll back a partially accepted file so its stored chunks cannot outlive the
   // untracked file and leak on a later delete; the whole file retries next sync.
