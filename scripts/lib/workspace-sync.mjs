@@ -343,6 +343,97 @@ async function gatherFiles(projectRoot) {
   return relPaths.map((relPath) => path.join(projectRoot, relPath));
 }
 
+/**
+ * Return the persisted rollback-delete queue, initializing missing buckets.
+ * @param state object - the workspace sync state record
+ * @return object - { memory: string[], knowledge: string[] }
+ */
+function pendingDeletesOf(state) {
+  if (!state.pendingDeletes || typeof state.pendingDeletes !== "object") {
+    state.pendingDeletes = { memory: [], knowledge: [] };
+  }
+  if (!Array.isArray(state.pendingDeletes.memory)) state.pendingDeletes.memory = [];
+  if (!Array.isArray(state.pendingDeletes.knowledge)) state.pendingDeletes.knowledge = [];
+  return state.pendingDeletes;
+}
+
+/**
+ * Record source ids whose rollback delete did not confirm so a later sync retries them.
+ * @param state object - the workspace sync state record
+ * @param target string - "memory" or "knowledge"
+ * @param ids string[] - source ids still stored remotely
+ */
+function queuePendingDeletes(state, target, ids) {
+  if (!ids || !ids.length) return;
+  const bucket = target === "memory" ? pendingDeletesOf(state).memory : pendingDeletesOf(state).knowledge;
+  const seen = new Set(bucket);
+  for (const id of ids) {
+    if (id != null && !seen.has(id)) {
+      seen.add(id);
+      bucket.push(id);
+    }
+  }
+}
+
+/**
+ * Collect the source ids of every currently tracked file, by target.
+ * @param state object - the workspace sync state record
+ * @param projectRoot string - absolute workspace root used to derive ids
+ * @return object - { memory: Set, knowledge: Set } of live source ids
+ */
+function liveSourceIds(state, projectRoot) {
+  const memory = new Set();
+  const knowledge = new Set();
+  for (const previous of Object.values(state.files || {})) {
+    if (!previous || !previous.relPath) continue;
+    if (previous.target === "memory") {
+      for (const id of memorySourceIds(projectRoot, previous.relPath, previous.chunkCount || 1)) {
+        memory.add(id);
+      }
+    } else if (previous.target === "knowledge") {
+      knowledge.add(fileSourceId(projectRoot, previous.relPath));
+    }
+  }
+  return { memory, knowledge };
+}
+
+/**
+ * Retry queued rollback deletes, dropping ids a tracked file now owns and keeping any the server does not confirm gone.
+ * @param client object - the Hydra client wrapper
+ * @param config object - the resolved plugin configuration
+ * @param state object - the workspace sync state record
+ * @param summary object - the run summary that collects surfaced errors
+ * @param live object - { memory: Set, knowledge: Set } of ids that must not be deleted
+ */
+async function drainPendingDeletes({ client, config, state, summary, live }) {
+  const pending = pendingDeletesOf(state);
+  const targets = [
+    { key: "memory", liveSet: live.memory, remove: (ids, opts) => client.deleteMemories(ids, opts) },
+    { key: "knowledge", liveSet: live.knowledge, remove: (ids, opts) => client.deleteKnowledge(ids, opts) }
+  ];
+  for (const target of targets) {
+    // An id a tracked file now owns was re-created by a successful retry; drop it
+    // without deleting so cleanup can never remove a live chunk. Delete only the
+    // ids that stay orphaned.
+    const queued = pending[target.key].filter((id) => !target.liveSet.has(id));
+    if (!queued.length) {
+      pending[target.key] = [];
+      continue;
+    }
+    try {
+      const result = await target.remove([...queued], { timeoutMs: config.writeTimeoutMs });
+      const deleted = new Set(result?.deletedIds || []);
+      pending[target.key] = queued.filter((id) => !deleted.has(id));
+      if (pending[target.key].length) {
+        summary.errors.push(`${target.key} rollback pending for ${pending[target.key].length} chunk(s); retained for retry`);
+      }
+    } catch (error) {
+      pending[target.key] = queued;
+      summary.errors.push(`${target.key} rollback retry failed: ${error.message}`);
+    }
+  }
+}
+
 export async function syncWorkspace({
   client,
   config,
@@ -422,19 +513,31 @@ export async function syncWorkspace({
   const memoryFiles = staged.filter((file) => file.target === "memory");
   const knowledgeFiles = staged.filter((file) => file.target === "knowledge");
 
+  const acceptedMemoryIds = new Set();
   const memoryItems = memoryFiles.flatMap((file) => buildMemoryItems(file, projectRoot, config));
   for (const batch of batchMemoryItems(memoryItems, config.maxFileSizeBytes)) {
-    await client.addMemories(batch, {
-      upsert: true,
-      timeoutMs: config.writeTimeoutMs
-    });
+    const { acceptedIds = [], failedIds = [] } =
+      (await client.addMemories(batch, { upsert: true, timeoutMs: config.writeTimeoutMs })) || {};
+    for (const id of acceptedIds) {
+      acceptedMemoryIds.add(id);
+    }
+    for (const id of failedIds) {
+      summary.errors.push(`memory ingest failed for ${id}; retained for retry`);
+    }
   }
 
+  const acceptedKnowledgeIds = new Set();
   for (let index = 0; index < knowledgeFiles.length; index += 5) {
     const batch = knowledgeFiles.slice(index, index + 5).map((file) =>
       buildKnowledgeItem(file, projectRoot, workspaceName)
     );
-    await client.uploadKnowledge(batch);
+    const { acceptedIds = [], failedIds = [] } = (await client.uploadKnowledge(batch)) || {};
+    for (const id of acceptedIds) {
+      acceptedKnowledgeIds.add(id);
+    }
+    for (const id of failedIds) {
+      summary.errors.push(`knowledge ingest failed for ${id}; retained for retry`);
+    }
   }
 
   if (candidatePaths == null) {
@@ -564,7 +667,23 @@ export async function syncWorkspace({
     }
   }
 
+  const rollbackMemoryIds = [];
+  const rollbackKnowledgeIds = [];
   for (const file of staged) {
+    const ids =
+      file.target === "memory"
+        ? memorySourceIds(projectRoot, file.relPath, file.chunkCount)
+        : [fileSourceId(projectRoot, file.relPath)];
+    const acceptedSet = file.target === "memory" ? acceptedMemoryIds : acceptedKnowledgeIds;
+    const acceptedHere = ids.filter((id) => acceptedSet.has(id));
+    if (!ids.length || acceptedHere.length !== ids.length) {
+      summary.errors.push(`${file.relPath}: ingest incomplete; retained for retry`);
+      if (acceptedHere.length) {
+        const sink = file.target === "memory" ? rollbackMemoryIds : rollbackKnowledgeIds;
+        sink.push(...acceptedHere);
+      }
+      continue;
+    }
     state.files[file.filePath] = {
       digest: file.digest,
       relPath: file.relPath,
@@ -575,6 +694,41 @@ export async function syncWorkspace({
     summary.synced += 1;
     summary.syncedFiles.push({ path: file.relPath, target: file.target });
     summary.syncedAs[file.target] += 1;
+  }
+
+  // Retry rollback deletes carried over from earlier runs now that tracking is
+  // final, so an id a completed retry re-created is dropped instead of deleted.
+  await drainPendingDeletes({
+    client,
+    config,
+    state,
+    summary,
+    live: liveSourceIds(state, projectRoot)
+  });
+
+  // Roll back a partially accepted file so its stored chunks cannot outlive the
+  // untracked file and leak on a later delete; the whole file retries next sync.
+  // Any id the delete does not confirm gone is queued so the next sync retries
+  // it, rather than orphaning a searchable chunk with no tracking.
+  if (rollbackMemoryIds.length) {
+    let deleted = new Set();
+    try {
+      const result = await client.deleteMemories(rollbackMemoryIds, { timeoutMs: config.writeTimeoutMs });
+      deleted = new Set(result?.deletedIds || []);
+    } catch (error) {
+      summary.errors.push(`memory rollback failed: ${error.message}`);
+    }
+    queuePendingDeletes(state, "memory", rollbackMemoryIds.filter((id) => !deleted.has(id)));
+  }
+  if (rollbackKnowledgeIds.length) {
+    let deleted = new Set();
+    try {
+      const result = await client.deleteKnowledge(rollbackKnowledgeIds, { timeoutMs: config.writeTimeoutMs });
+      deleted = new Set(result?.deletedIds || []);
+    } catch (error) {
+      summary.errors.push(`knowledge rollback failed: ${error.message}`);
+    }
+    queuePendingDeletes(state, "knowledge", rollbackKnowledgeIds.filter((id) => !deleted.has(id)));
   }
 
   return summary;

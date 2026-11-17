@@ -279,13 +279,26 @@ async function performRecall(client, config, query) {
   };
 }
 
-async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText }) {
-  await client.addConversationMemory(userPrompt, assistantText, {
+/**
+ * Throw when an ingest reported items the server did not accept so the caller retries.
+ * @param result object - { acceptedIds, failedIds } from a client ingest call
+ * @param label string - short description used in the thrown message
+ */
+function assertIngestAccepted(result, label) {
+  const failedIds = result && Array.isArray(result.failedIds) ? result.failedIds : [];
+  if (failedIds.length) {
+    throw new Error(`${label}: ${failedIds.length} item(s) not accepted`);
+  }
+}
+
+async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId }) {
+  const result = await client.addConversationMemory(userPrompt, assistantText, {
     userName: configResult.config.userName || undefined,
     customInstructions:
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
-    sourceId: `claude-turn:${sessionId}:${Date.now()}`
+    sourceId: sourceId || `claude-turn:${sessionId}:${Date.now()}`
   });
+  assertIngestAccepted(result, "conversation capture");
 }
 
 async function autoUpsertSession({ client, configResult, sessionId, session }) {
@@ -295,7 +308,7 @@ async function autoUpsertSession({ client, configResult, sessionId, session }) {
     return false;
   }
 
-  await client.addTextMemory(transcript, {
+  const result = await client.addTextMemory(transcript, {
     infer: true,
     isMarkdown: true,
     title: `Claude Code session ${sessionId}`,
@@ -304,10 +317,59 @@ async function autoUpsertSession({ client, configResult, sessionId, session }) {
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: sessionMemorySourceId(sessionId)
   });
+  assertIngestAccepted(result, "session upsert");
 
   session.lastSessionTranscriptHash = transcriptHash;
   session.lastSessionTranscriptUpdatedAt = new Date().toISOString();
   return true;
+}
+
+const MAX_PENDING_CAPTURES = 50;
+
+/**
+ * Append a turn to the session's retry queue, trimming the oldest past the cap.
+ * @param session object - the per-session state record
+ * @param capture object - the turn to retry later
+ */
+function queuePendingCapture(session, capture) {
+  if (!Array.isArray(session.pendingCaptures)) {
+    session.pendingCaptures = [];
+  }
+  if (session.pendingCapture) {
+    session.pendingCaptures.unshift(session.pendingCapture);
+    session.pendingCapture = null;
+  }
+  session.pendingCaptures.push(capture);
+  if (session.pendingCaptures.length > MAX_PENDING_CAPTURES) {
+    session.pendingCaptures = session.pendingCaptures.slice(-MAX_PENDING_CAPTURES);
+  }
+}
+
+/**
+ * Flush queued turn captures oldest first, keeping failures so a stuck turn never blocks newer replies.
+ * @param client object - the Hydra client wrapper
+ * @param configResult object - the resolved plugin configuration
+ * @param session object - the per-session state record whose queue drains
+ */
+async function flushPendingCaptures({ client, configResult, session }) {
+  if (!Array.isArray(session.pendingCaptures) || !session.pendingCaptures.length) {
+    return;
+  }
+  const remaining = [];
+  for (const pending of session.pendingCaptures) {
+    try {
+      await autoCaptureTurn({ client, configResult, ...pending });
+      if (pending.captureHash) {
+        session.lastCaptureHash = pending.captureHash;
+        session.lastCaptureUpdatedAt = new Date().toISOString();
+      }
+    } catch {
+      // Keep the turn queued so a transient failure retries on a later stop; the
+      // queue is bounded by MAX_PENDING_CAPTURES, which evicts the oldest turns.
+      remaining.push(pending);
+    }
+  }
+  session.pendingCaptures = remaining;
 }
 
 async function handleSessionStart() {
@@ -529,25 +591,44 @@ async function handleStop() {
     savedAt: now
   });
 
+  // Persist the completed exchange before ingest so a failed API call leaves
+  // the reply on disk for retry, not only in memory.
+  await writeState(dataDir, state);
+
   const shouldSkipTurnCapture = userPrompt.length < 24 && assistantText.length < 24;
   if (!client || configResult.config.captureMode === "off") {
-    await writeState(dataDir, state);
     return;
   }
 
-  if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
-    if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
-      await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText });
-      session.lastCaptureHash = captureHash;
-      session.lastCaptureUpdatedAt = new Date().toISOString();
-    }
+  const capturesTurn =
+    configResult.config.captureMode === "turn" || configResult.config.captureMode === "both";
+
+  if (capturesTurn && !shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
+    queuePendingCapture(session, {
+      sessionId,
+      sourceId: `claude-turn:${sessionId}:${Date.now()}`,
+      userPrompt,
+      assistantText,
+      captureHash
+    });
+    // Persist the queued turn before any network call so a stop timeout or a
+    // killed hook still retries it on the next stop.
+    await writeState(dataDir, state);
   }
 
-  if (
-    configResult.config.captureMode === "session-upsert" ||
-    configResult.config.captureMode === "both"
-  ) {
-    await autoUpsertSession({ client, configResult, sessionId, session });
+  try {
+    if (capturesTurn) {
+      await flushPendingCaptures({ client, configResult, session });
+    }
+
+    if (
+      configResult.config.captureMode === "session-upsert" ||
+      configResult.config.captureMode === "both"
+    ) {
+      await autoUpsertSession({ client, configResult, sessionId, session });
+    }
+  } catch {
+    // keep the remaining pending captures so the next stop retries them
   }
 
   await writeState(dataDir, state);
@@ -700,7 +781,7 @@ async function handleRemember(args) {
     throw new Error("remember content was empty after redaction");
   }
 
-  await runtime.client.addTextMemory(sanitizedText, {
+  const remembered = await runtime.client.addTextMemory(sanitizedText, {
     infer: true,
     isMarkdown: /[#*_`>-]/.test(sanitizedText),
     title: "Claude Code manual memory",
@@ -710,6 +791,7 @@ async function handleRemember(args) {
       DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: `manual-memory:${Date.now()}`
   });
+  assertIngestAccepted(remembered, "remember");
 
   process.stdout.write(
     wasRedacted(text, sanitizedText)
@@ -742,7 +824,7 @@ async function handleSaveSession(args) {
     runtime.configResult.workspaceName
   );
 
-  await runtime.client.addTextMemory(transcript, {
+  const saved = await runtime.client.addTextMemory(transcript, {
     infer: true,
     isMarkdown: true,
     title: `Claude Code session ${sessionId}`,
@@ -752,6 +834,7 @@ async function handleSaveSession(args) {
       DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
     sourceId: sessionMemorySourceId(sessionId)
   });
+  assertIngestAccepted(saved, "save-session");
 
   const payload = {
     sessionId,
@@ -973,6 +1056,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
+  process.stderr.write(`${redactSecrets(error.message)}\n`);
   process.exitCode = 1;
 });

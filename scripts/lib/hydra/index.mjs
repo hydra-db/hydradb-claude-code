@@ -11,6 +11,7 @@
 // budgets, and send API-Version: 2 (the SDK does this).
 
 import { HydraDBClient, HydraDBError, HydraDBTimeoutError } from "../../vendor/hydradb-sdk.mjs";
+import { redactSecrets, registerSecret } from "../sanitize.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -54,10 +55,10 @@ function translateError(error, label, timeoutMs) {
   if (error instanceof HydraDBError) {
     const status = error.statusCode != null ? ` with ${error.statusCode}` : "";
     const body = coerceBody(error.body);
-    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`);
+    return new HydraWrapperError(redactSecrets(`${label} failed${status}${body ? `: ${body}` : ""}`));
   }
   const message = error instanceof Error ? error.message : String(error);
-  return new HydraWrapperError(`${label} failed: ${message}`);
+  return new HydraWrapperError(redactSecrets(`${label} failed: ${message}`));
 }
 
 // The SDK deserializes the v2 wire response into camelCase (deletedCount,
@@ -169,6 +170,42 @@ function classifyDeletion(requestedIds, envelope, data) {
   return none;
 }
 
+/**
+ * Split requested ids into accepted and failed from the per-item ingest results.
+ * @param requestedIds string[] - ids submitted in this batch
+ * @param data object - normalized ingest response envelope
+ * @return object - { acceptedIds, failedIds }; unconfirmed items stay failed for retry
+ */
+export function classifyIngestion(requestedIds, data = {}) {
+  const ids = (requestedIds || []).map((id) => String(id));
+  if (!ids.length) {
+    return { acceptedIds: [], failedIds: [] };
+  }
+  const results = Array.isArray(data.results) ? data.results : [];
+  // With no per-item results, fall back to the envelope: accept the batch only
+  // when nothing signals failure, otherwise retry all of it.
+  if (!results.length) {
+    const envelopeOk = data.success !== false && Number(data.failed_count ?? 0) === 0;
+    return envelopeOk
+      ? { acceptedIds: ids, failedIds: [] }
+      : { acceptedIds: [], failedIds: ids };
+  }
+  // With per-item results, accept an id only when a result confirms it without a
+  // failure signal; an id missing from the results is unconfirmed and stays
+  // failed for retry rather than being counted as stored.
+  const confirmed = new Set(
+    results
+      .filter((r) => r && r.id != null && !(r.status === "failed" || r.error || r.error_code))
+      .map((r) => String(r.id))
+  );
+  const accepted = data.success === false ? [] : ids.filter((id) => confirmed.has(id));
+  const acceptedSet = new Set(accepted);
+  return {
+    acceptedIds: accepted,
+    failedIds: ids.filter((id) => !acceptedSet.has(id))
+  };
+}
+
 export function createHydraWrapper({
   apiKey,
   tenantId,
@@ -180,6 +217,7 @@ export function createHydraWrapper({
   sdkClient,
   fetch: fetchImpl
 } = {}) {
+  registerSecret(apiKey);
   const database = tenantId || "";
   const collection = subTenantId ?? "";
 

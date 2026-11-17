@@ -49,12 +49,37 @@ info "npm install complete"
 
 printf "\n%s\n" "── Configuration ──"
 
-if [ ! -f config.json ]; then
-  cp config.example.json config.json
-  info "Created config.json from config.example.json"
-  warn "Edit config.json and set your HYDRADB_API_KEY and HYDRADB_TENANT_ID."
+# The loader reads <dataDir>/config.json for every workspace, so write the
+# template there when we can resolve the data directory; a config in the plugin
+# checkout is only read when the plugin folder itself is the open workspace.
+PLUGIN_NAME="$(node -e 'try{process.stdout.write((require("./.claude-plugin/plugin.json").name||"").trim())}catch(e){}' 2>/dev/null || true)"
+if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$CLAUDE_PLUGIN_DATA"
+elif [ -n "$PLUGIN_NAME" ]; then
+  DATA_DIR="$HOME/.claude/plugins/data/${PLUGIN_NAME}-inline"
 else
-  info "config.json already exists — skipping"
+  DATA_DIR=""
+fi
+
+if [ -n "$DATA_DIR" ]; then
+  CONFIG_PATH="$DATA_DIR/config.json"
+  if [ ! -f "$CONFIG_PATH" ]; then
+    mkdir -p "$DATA_DIR"
+    cp config.example.json "$CONFIG_PATH"
+    info "Created $CONFIG_PATH (read for every workspace)"
+    warn "Set HYDRADB_API_KEY, HYDRADB_TENANT_ID, and HYDRADB_COLLECTION in your environment, or edit $CONFIG_PATH."
+  else
+    info "$CONFIG_PATH already exists - skipping"
+  fi
+else
+  CONFIG_PATH=".hydradb-plugin.json"
+  if [ ! -f .hydradb-plugin.json ]; then
+    cp config.example.json .hydradb-plugin.json
+    info "Created .hydradb-plugin.json from config.example.json"
+    warn "Set HYDRADB_API_KEY, HYDRADB_TENANT_ID, and HYDRADB_COLLECTION in your environment, or copy .hydradb-plugin.json into each workspace you open."
+  else
+    info ".hydradb-plugin.json already exists - skipping"
+  fi
 fi
 
 # ── Syntax check ───────────────────────────────────────────────────────────────
@@ -64,7 +89,7 @@ printf "\n%s\n" "── Running syntax check ──"
 if npm run check; then
   info "Syntax check passed"
 else
-  warn "Syntax check had issues — review errors above"
+  warn "Syntax check had issues - review errors above"
 fi
 
 # ── Next steps ─────────────────────────────────────────────────────────────────
@@ -74,8 +99,10 @@ echo ""
 echo "  1. Set your HydraDB credentials:"
 echo "       export HYDRADB_API_KEY=\"your-api-key\""
 echo "       export HYDRADB_TENANT_ID=\"your-tenant-id\""
+echo "       export HYDRADB_COLLECTION=\"\"   # empty uses the default sub-tenant"
 echo ""
-echo "  2. Or edit config.json directly with your values."
+echo "  2. Or edit the config file created above with your values:"
+echo "       ${CONFIG_PATH}"
 echo ""
 echo "  3. Install the plugin in Claude Code:"
 echo "       /plugin marketplace add /absolute/path/to/hydradb-claude-code"

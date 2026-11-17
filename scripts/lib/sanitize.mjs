@@ -24,6 +24,16 @@ const SECRET_PATTERNS = [
   }
 ];
 
+// Literal credentials registered at construction and stripped by exact match,
+// covering a key or token the server echoes whose shape fits no pattern above.
+const registeredSecrets = new Set();
+
+export function registerSecret(value) {
+  if (typeof value === "string" && value.trim().length > 0) {
+    registeredSecrets.add(value.trim());
+  }
+}
+
 export function normalizeText(text) {
   return String(text || "").replace(/\r\n/g, "\n");
 }
@@ -39,6 +49,10 @@ export function truncateText(text, maxLength) {
 
 export function redactSecrets(text) {
   let redacted = normalizeText(text);
+
+  for (const secret of registeredSecrets) {
+    redacted = redacted.split(secret).join("[REDACTED:credential]");
+  }
 
   for (const { label, regex } of SECRET_PATTERNS) {
     redacted = redacted.replace(regex, `[REDACTED:${label}]`);
