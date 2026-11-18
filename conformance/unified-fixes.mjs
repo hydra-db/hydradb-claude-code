@@ -383,5 +383,28 @@ export async function runUnifiedFixTests() {
     tests += 1;
   }
 
+  // 13) OpenHack on #14: fitting a server-sized recall stays linear. A 2 MB
+  //     prompt of long lines and repeated bodies, and 20,000 graph paths, each
+  //     took 19 s and 34 s before; both are bounded and well under a second.
+  {
+    const body = (i) => `fact ${i} ` + "lorem ipsum dolor sit amet ".repeat(8);
+    const llmPrompt = Array.from({ length: 10000 }, (_, i) => body(i % 2000)).join("\n");
+    const chunks = Array.from({ length: 2000 }, (_, i) => ({ contextId: `c${i}`, content: body(i).trim() }));
+    let started = Date.now();
+    const fitted = fitUnifiedPrompt({ llmPrompt, chunks }, 6000);
+    const promptMs = Date.now() - started;
+    assert.ok(fitted.length <= 6000, `prompt bounded (${fitted.length})`);
+    assert.ok(promptMs < 3000, `prompt fitted in ${promptMs} ms`);
+
+    const unified = { llmPrompt: "p", chunks: [], graph: Array.from({ length: 20000 }, (_, i) => ({ pathSummary: `path ${i} ` + "x".repeat(80) })) };
+    started = Date.now();
+    const payload = fitRecallPayload({ query: "q", searchMode: "unified", unified, errors: [] });
+    const payloadMs = Date.now() - started;
+    assert.ok(JSON.stringify(payload).length <= QUERY_JSON_CHARS, `payload bounded (${JSON.stringify(payload).length})`);
+    assert.equal(payload.unified.graphPathsTotal, 20000, "the dropped count is kept");
+    assert.ok(payloadMs < 3000, `payload fitted in ${payloadMs} ms`);
+    tests += 1;
+  }
+
   return { tests };
 }

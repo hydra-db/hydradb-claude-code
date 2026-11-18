@@ -289,10 +289,14 @@ function cutAtWord(text, max) {
 // touched. If the prompt is still over budget, it is cut at a line with a
 // note, so the bound always holds. A prompt that fits is returned untouched.
 export function fitUnifiedPrompt(result, maxChars) {
-  const prompt = typeof result?.llmPrompt === "string" ? result.llmPrompt : "";
-  if (prompt.length <= maxChars) {
-    return prompt;
+  const full = typeof result?.llmPrompt === "string" ? result.llmPrompt : "";
+  if (full.length <= maxChars) {
+    return full;
   }
+  // The work below grows with the prompt and the server decides its size, so
+  // only a bounded prefix is fitted. PROMPT_WORK_FACTOR budgets is far more
+  // than shortening bodies in place can bring back under one budget.
+  const prompt = full.length > maxChars * PROMPT_WORK_FACTOR ? full.slice(0, maxChars * PROMPT_WORK_FACTOR) : full;
   const chunks = [
     ...(Array.isArray(result?.chunks) ? result.chunks : []),
     ...(Array.isArray(result?.forcefulRelations) ? result.forcefulRelations.map((r) => r?.chunk).filter(Boolean) : [])
@@ -312,9 +316,16 @@ export function fitUnifiedPrompt(result, maxChars) {
   // claim their spans first; a span that overlaps one already claimed is left
   // to it.
   const located = [];
-  const byLength = [...bodies].sort((x, y) => y.text.length - x.text.length);
-  for (const body of byLength) {
+  // Only the longest MAX_LOCATED_BODIES are searched for: each search scans
+  // the prompt, and shortening the longest frees the most room.
+  const byLength = [...bodies].sort((x, y) => y.text.length - x.text.length).slice(0, MAX_LOCATED_BODIES);
+  // Capped, so the overlap check stays small whatever the server repeats;
+  // bodies past the cap are left whole and the line pass below handles them.
+  locate: for (const body of byLength) {
     for (let at = prompt.indexOf(body.text); at >= 0; at = prompt.indexOf(body.text, at + body.text.length)) {
+      if (located.length >= MAX_LOCATED_BODIES) {
+        break locate;
+      }
       if (!located.some((l) => at < l.at + l.text.length && l.at < at + body.text.length)) {
         located.push({ ...body, at });
       }
@@ -358,11 +369,15 @@ export function fitUnifiedPrompt(result, maxChars) {
       .map((line, index) => ({ index, length: line.length }))
       .filter((c) => c.length > 160 && !structural.test(lines[c.index]))
       .sort((x, y) => y.length - x.length);
+    // A running total instead of re-joining every line for each candidate.
+    let length = text.length;
     for (const c of candidates) {
-      if (lines.join("\n").length <= maxChars) {
+      if (length <= maxChars) {
         break;
       }
+      const before = lines[c.index].length;
       lines[c.index] = `${cutAtWord(lines[c.index], 120) ?? lines[c.index]} …`;
+      length -= before - lines[c.index].length;
     }
     text = lines.join("\n");
   }
@@ -467,6 +482,24 @@ export const QUERY_CHUNK_CHARS = 800;
 // relations): held under the host's tool-output cut.
 export const QUERY_JSON_CHARS = 24_000;
 
+// How many budgets of a unified prompt fitUnifiedPrompt works on, and how many
+// result bodies it locates in it. Both bound work on server-sized input.
+const PROMPT_WORK_FACTOR = 64;
+const MAX_LOCATED_BODIES = 400;
+
+// popUntilFits drops entries from the end of array until a payload of
+// payloadSize characters fits QUERY_JSON_CHARS. Each entry's share of the
+// serialised payload is subtracted rather than the payload re-serialised per
+// entry, which grew with the square of the array.
+function popUntilFits(array, payloadSize) {
+  let size = payloadSize;
+  while (Array.isArray(array) && array.length && size > QUERY_JSON_CHARS) {
+    const removed = array.pop();
+    // The entry and the comma before it; the last entry has no comma.
+    size -= (JSON.stringify(removed)?.length ?? 4) + (array.length ? 1 : 0);
+  }
+}
+
 // Reduce a unified recall until the payload fits QUERY_JSON_CHARS, one step
 // at a time and only as far as needed, flagging each: enrichment and temporal
 // facts shortened, graph paths down to their summaries, chunk bodies cut
@@ -517,8 +550,10 @@ export function fitRecallPayload(payload) {
     },
     () => {
       const total = Array.isArray(unified.graph) ? unified.graph.length : 0;
-      while (size() > QUERY_JSON_CHARS && unified.graph?.length) unified.graph.pop();
-      if (total && unified.graph.length < total) unified.graphPathsTotal = total;
+      // Set before trimming so its own characters count toward the bound.
+      if (total) unified.graphPathsTotal = total;
+      popUntilFits(unified.graph, size());
+      if (total && unified.graph.length === total) delete unified.graphPathsTotal;
     },
     () => {
       // Many results: every body, enrichment and temporal list down to a
@@ -541,8 +576,9 @@ export function fitRecallPayload(payload) {
     },
     () => {
       const total = Array.isArray(unified.forcefulRelations) ? unified.forcefulRelations.length : 0;
-      while (size() > QUERY_JSON_CHARS && unified.forcefulRelations?.length) unified.forcefulRelations.pop();
-      if (total && unified.forcefulRelations.length < total) unified.forcefulRelationsTotal = total;
+      if (total) unified.forcefulRelationsTotal = total;
+      popUntilFits(unified.forcefulRelations, size());
+      if (total && unified.forcefulRelations.length === total) delete unified.forcefulRelationsTotal;
     }
   ];
   for (const step of steps) {
