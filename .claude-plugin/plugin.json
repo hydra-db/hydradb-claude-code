@@ -1,6 +1,6 @@
 {
   "name": "hydradb",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Secure HydraDB automation for Claude Code with workspace sync, prompt recall, and conversation capture.",
   "author": {
     "name": "HydraDB",

@@ -7,10 +7,18 @@ import path from "node:path";
 import process from "node:process";
 
 import { formatStatus, loadConfig, PROJECT_CONFIG_FILES } from "./lib/config.mjs";
-import { buildHydraContextBlock, buildUnifiedStructuredString } from "./lib/context-format.mjs";
+import {
+  boundUnifiedRecall,
+  buildHydraContextBlock,
+  buildUnifiedStructuredString,
+  fitRecallPayload,
+  QUERY_OUTPUT_CHARS
+} from "./lib/context-format.mjs";
 import {
   combineRecallErrors,
+  clipUtf8,
   DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
+  UNIFIED_MAX_ITEM_TEXT_BYTES,
   EMPTY_UNIFIED_RECALL,
   HydraClient
 } from "./lib/hydra-client.mjs";
@@ -162,7 +170,9 @@ async function getRuntime() {
         tenantId: configResult.config.tenantId,
         subTenantId: configResult.config.subTenantId,
         requestTimeoutMs: configResult.config.requestTimeoutMs,
-        writeTimeoutMs: configResult.config.writeTimeoutMs
+        writeTimeoutMs: configResult.config.writeTimeoutMs,
+        layoutCacheFile: dataDir ? path.join(dataDir, "layout-cache.json") : undefined,
+        onDebug: (event, payload) => appendDebugLog(dataDir, configResult.config.debug, event, payload)
       })
     : null;
 
@@ -197,19 +207,36 @@ function resolveSessionId(args, state) {
   return explicit || state.lastSessionId || "";
 }
 
-function renderSessionTranscript(sessionId, session, workspaceName) {
-  const turns = Array.isArray(session.turns) ? session.turns : [];
+// `maxBytes` (a unified database's per-item text limit) keeps the latest
+// turns and drops the oldest, naming how many were left out; without it the
+// transcript is rendered exactly as before.
+function renderSessionTranscript(sessionId, session, workspaceName, maxBytes) {
+  const allTurns = Array.isArray(session.turns) ? session.turns : [];
+  if (maxBytes) {
+    for (let skip = 0; skip < allTurns.length; skip += 1) {
+      const text = renderTranscriptTurns(sessionId, allTurns.slice(skip), workspaceName, skip);
+      if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+        return text;
+      }
+    }
+    return clipUtf8(renderTranscriptTurns(sessionId, allTurns.slice(-1), workspaceName, allTurns.length - 1), maxBytes);
+  }
+  return renderTranscriptTurns(sessionId, allTurns, workspaceName, 0);
+}
+
+function renderTranscriptTurns(sessionId, turns, workspaceName, omitted) {
   const header = [
     `# Claude Code session`,
     ``,
     `session_id: ${sessionId}`,
     `workspace: ${workspaceName}`,
-    `turn_count: ${turns.length}`
+    `turn_count: ${turns.length + omitted}`,
+    ...(omitted ? [`omitted_turns: ${omitted} (oldest, to fit the size limit)`] : [])
   ];
 
   const body = turns.flatMap((turn, index) => [
     ``,
-    `## Turn ${index + 1}`,
+    `## Turn ${index + 1 + omitted}`,
     ``,
     `### User`,
     turn.user,
@@ -329,17 +356,62 @@ async function performRecall(client, config, query) {
   };
 }
 
-async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText }) {
+async function autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId }) {
   await client.addConversationMemory(userPrompt, assistantText, {
     userName: configResult.config.userName || undefined,
     customInstructions:
       configResult.config.memoryCustomInstructions || DEFAULT_MEMORY_CAPTURE_INSTRUCTIONS,
-    sourceId: `claude-turn:${sessionId}:${Date.now()}`
+    sourceId: sourceId || `claude-turn:${sessionId}:${Date.now()}`
   });
 }
 
+// Turn captures that failed, kept on the session and retried (oldest first,
+// under their original context id, so a retry upserts rather than
+// duplicating) on a later Stop. Bounded so a long outage cannot grow state
+// without limit; the oldest are dropped past the cap, and say so.
+const MAX_PENDING_TURN_CAPTURES = 20;
+// Retries start only inside this share of the Stop hook's 20s budget, and
+// stop at the first failure (the service is likely still down), so an outage
+// costs one timed-out request, not one per queued turn.
+const STOP_RETRY_BUDGET_MS = 8_000;
+
+async function retryPendingTurnCaptures({ client, configResult, sessionId, session, errors, deadline, persist, removed }) {
+  const pending = Array.isArray(session.pendingTurnCaptures) ? session.pendingTurnCaptures : [];
+  while (pending.length && Date.now() < deadline) {
+    const entry = pending[0];
+    try {
+      await autoCaptureTurn({
+        client,
+        configResult,
+        sessionId,
+        userPrompt: entry.user,
+        assistantText: entry.assistant,
+        sourceId: entry.sourceId
+      });
+    } catch (error) {
+      errors.push(`turn capture retry ${entry.sourceId}: ${error.message}`);
+      break;
+    }
+    removed.add(pending.shift().sourceId);
+    session.pendingTurnCaptures = pending;
+    await persist();
+  }
+}
+
+function queueFailedTurnCapture(session, entry, errors, removed) {
+  const pending = Array.isArray(session.pendingTurnCaptures) ? session.pendingTurnCaptures : [];
+  pending.push(entry);
+  while (pending.length > MAX_PENDING_TURN_CAPTURES) {
+    const dropped = pending.shift();
+    removed.add(dropped.sourceId);
+    errors.push(`turn capture ${dropped.sourceId} dropped after ${MAX_PENDING_TURN_CAPTURES} pending retries`);
+  }
+  session.pendingTurnCaptures = pending;
+}
+
 async function autoUpsertSession({ client, configResult, sessionId, session }) {
-  const transcript = renderSessionTranscript(sessionId, session, configResult.workspaceName);
+  const maxBytes = (await client.isUnified()) ? UNIFIED_MAX_ITEM_TEXT_BYTES - 1024 : undefined;
+  const transcript = renderSessionTranscript(sessionId, session, configResult.workspaceName, maxBytes);
   const transcriptHash = digest(transcript);
   if (session.lastSessionTranscriptHash === transcriptHash) {
     return false;
@@ -600,11 +672,43 @@ async function handleStop() {
     return;
   }
 
+  // A refused or failed write must not lose the turn: the error is reported,
+  // the other capture still runs, and the state (with this turn appended and
+  // the hashes of only what was actually saved) is always written, so the
+  // next Stop retries what failed.
+  const captureErrors = [];
+  // Source ids this hook saved or dropped: the only ones a write may take off
+  // the queue, so an overlapping Stop's newly queued turn survives the merge.
+  const removedTurnCaptures = new Set();
+  const persist = () => writeState(dataDir, state, { removedTurnCaptures: [...removedTurnCaptures] });
   if (configResult.config.captureMode === "turn" || configResult.config.captureMode === "both") {
+    const deadline = Date.now() + STOP_RETRY_BUDGET_MS;
+    let reachable = true;
     if (!shouldSkipTurnCapture && session.lastCaptureHash !== captureHash) {
-      await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText });
+      const sourceId = `claude-turn:${sessionId}:${Date.now()}`;
+      const entry = { user: userPrompt, assistant: assistantText, sourceId };
+      // Queued and persisted before any network call, so a hook the host
+      // kills mid-request still leaves this turn for the next Stop. The hash
+      // is recorded now (versioned by its timestamp when state is merged, so
+      // both move together) so the next Stop does not capture it twice.
       session.lastCaptureHash = captureHash;
       session.lastCaptureUpdatedAt = new Date().toISOString();
+      queueFailedTurnCapture(session, entry, captureErrors, removedTurnCaptures);
+      await persist();
+      try {
+        await autoCaptureTurn({ client, configResult, sessionId, userPrompt, assistantText, sourceId });
+        removedTurnCaptures.add(sourceId);
+        session.pendingTurnCaptures = session.pendingTurnCaptures.filter((pending) => pending.sourceId !== sourceId);
+        await persist();
+      } catch (error) {
+        reachable = false;
+        captureErrors.push(`turn capture: ${error.message}`);
+      }
+    }
+    if (reachable) {
+      await retryPendingTurnCaptures({
+        client, configResult, sessionId, session, errors: captureErrors, deadline, persist, removed: removedTurnCaptures
+      });
     }
   }
 
@@ -612,10 +716,19 @@ async function handleStop() {
     configResult.config.captureMode === "session-upsert" ||
     configResult.config.captureMode === "both"
   ) {
-    await autoUpsertSession({ client, configResult, sessionId, session });
+    try {
+      await autoUpsertSession({ client, configResult, sessionId, session });
+    } catch (error) {
+      captureErrors.push(`session upsert: ${error.message}`);
+    }
   }
 
-  await writeState(dataDir, state);
+  await persist();
+
+  if (captureErrors.length) {
+    await appendDebugLog(dataDir, configResult.config.debug, "stop-capture-error", { errors: captureErrors });
+    process.stderr.write(`[hydradb] capture failed, will retry on the next turn: ${captureErrors.join("; ")}\n`);
+  }
 }
 
 async function handlePostToolUse() {
@@ -815,7 +928,8 @@ async function handleSaveSession(args) {
   const transcript = renderSessionTranscript(
     sessionId,
     session,
-    runtime.configResult.workspaceName
+    runtime.configResult.workspaceName,
+    (await runtime.client.isUnified()) ? UNIFIED_MAX_ITEM_TEXT_BYTES - 1024 : undefined
   );
 
   const stored = await runtime.client.addTextMemory(transcript, {
@@ -855,7 +969,11 @@ function renderRecallText(result) {
     // context_id/score/content/enrichment, forceful relations, graph path
     // summaries. The --json payload carries llmPrompt for the model.
     const structured = buildUnifiedStructuredString(result.unified);
-    lines.push(structured || "Context:\n- none");
+    lines.push(
+      structured.length > QUERY_OUTPUT_CHARS
+        ? `${structured.slice(0, QUERY_OUTPUT_CHARS)}\n[output cut at ${QUERY_OUTPUT_CHARS} characters]`
+        : structured || "Context:\n- none"
+    );
   }
 
   if (result.searchMode === "memory" || result.searchMode === "both") {
@@ -905,10 +1023,12 @@ async function handleRecall(args, commandName = "recall") {
     throw new Error("HydraDB is not configured");
   }
 
-  const payload = {
+  const recall = await performRecall(runtime.client, runtime.configResult.config, query);
+  const payload = fitRecallPayload({
     query,
-    ...(await performRecall(runtime.client, runtime.configResult.config, query))
-  };
+    ...recall,
+    ...(recall.unified ? { unified: boundUnifiedRecall(recall.unified) } : {})
+  });
 
   if (jsonMode) {
     emitJson(payload);
