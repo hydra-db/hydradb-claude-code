@@ -98,7 +98,8 @@ The plugin resolves configuration from multiple layers (later layers override ea
 | `autoRecall` | `true` | Automatically recall HydraDB context on each user prompt |
 | `autoIngest` | `true` | Automatically sync workspace docs on session start |
 | `captureMode` | `session-upsert` | `turn`, `session-upsert`, `both`, or `off` |
-| `searchMode` | `memory` | `memory`, `knowledge`, `both`, `unified`, or `auto`. On a database created with `type: "unified"` the plugin detects the layout, sends no `type`, and injects the server-built `llm_prompt` from the four-key query response (see `hydradb-api-info/unified-databases.md`) |
+| `layout` | `split` | Explicit `split` or `unified`, also set by `HYDRADB_LAYOUT`. Unified is not enabled in production; keep split until rollout is confirmed. No probing or cross-layout retries. See [unified rollout preparation](hydradb-api-info/unified-databases.md). |
+| `searchMode` | `memory` | Split recall choice: `memory`, `knowledge`, `both`, `unified`, or `auto` (the last two resolve to memory on split). Explicit unified layout makes one selector-free query and injects the safe server prompt verbatim. |
 | `ingestionMode` | `memory` | `memory`, `knowledge`, or `auto` |
 | `recallMode` | `thinking` | Recall strategy passed to HydraDB |
 | `graphContext` | `true` | Include graph entity paths and relations in recall |

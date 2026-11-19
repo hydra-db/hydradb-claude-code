@@ -1,4 +1,5 @@
 {
+  "layout": "split",
   "apiBaseUrl": "https://api.hydradb.com",
   "apiKey": "${HYDRADB_API_KEY}",
   "tenantId": "${HYDRADB_TENANT_ID}",

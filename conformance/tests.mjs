@@ -196,7 +196,7 @@ export async function runHttpTests() {
   {
     const wrap = (envelope) =>
       createHydraWrapper({
-        apiKey: "k",
+        apiKey: "synthetic-claude-contract-key",
         tenantId: "db_test",
         subTenantId: "col_test",
         sdkClient: { context: { delete: async () => envelope } }
@@ -339,7 +339,7 @@ export async function runHttpTests() {
         inspect: async () => ({ success: true, data: { sourceId: "s1", chunkContent: "body" } })
       }
     };
-    const w = createHydraWrapper({ apiKey: "k", tenantId: "db_test", subTenantId: "col_test", sdkClient: spy });
+    const w = createHydraWrapper({ apiKey: "synthetic-claude-contract-key", tenantId: "db_test", subTenantId: "col_test", sdkClient: spy });
     const q = await w.context.query({ query: "x", kind: "memory" });
     assert.equal(q.chunks[0].chunk_content, "c", "query result must be snake_cased at the seam");
     assert.equal(q.chunks[0].source_title, "T");
@@ -380,6 +380,7 @@ export async function runHttpTests() {
     assert.equal(res.llmPrompt, UNIFIED_QUERY_RESPONSE.llm_prompt, "llm_prompt is kept whole");
     assert.equal(res.chunks.length, 2);
     assert.deepEqual(res.chunks[0], {
+      ...UNIFIED_QUERY_RESPONSE.chunks[0],
       contextId: "chat-2026-07-29#w2",
       chunkId: "ck_9f2",
       score: 0.87,
@@ -416,7 +417,8 @@ export async function runHttpTests() {
       "a forceful relation's chunk has the same enrichment string"
     );
     assert.equal(res.forcefulRelations[0].chunk.enrichmentKind, "decision_trace");
-    assert.deepEqual(Object.keys(res).sort(), ["chunks", "forcefulRelations", "graph", "layout", "llmPrompt"]);
+    assert.deepEqual(res.raw, UNIFIED_QUERY_RESPONSE);
+    assert.deepEqual(Object.keys(res).sort(), [...new Set([...Object.keys(UNIFIED_QUERY_RESPONSE), "raw", "layout", "llmPrompt", "forcefulRelations"])].sort());
     for (const key of ["chunk_content", "graph_context", "sources", "additional_context", "relations"]) {
       assert.ok(!(key in res), `no split-era or superseded key ${key} on a unified result`);
     }
@@ -512,8 +514,7 @@ export async function runHttpTests() {
       errors: [],
       maxContextChars: 7000
     });
-    assert.ok(block.startsWith("<hydradb-context>\n"));
-    assert.ok(block.includes(`\n${UNIFIED_QUERY_RESPONSE.llm_prompt}\n`), "llm_prompt is injected verbatim");
+    assert.equal(block, UNIFIED_QUERY_RESPONSE.llm_prompt, "llm_prompt is injected verbatim without a wrapper");
     for (const label of ["### 1.", "### 2.", "### R1.", "[P1]", "[P2]"]) {
       assert.ok(block.includes(label), `citation label ${label} survives`);
     }
@@ -643,14 +644,13 @@ export async function runHttpTests() {
     // moves hook context past ~10k characters to a file and shows a preview,
     // which cut the citations off). The normalised result above stays whole;
     // only what is injected is fitted.
-    assert.ok(block.length <= 7000, `a unified block is held to maxContextChars (${block.length})`);
-    assert.ok(block.startsWith("<hydradb-context>") && block.endsWith("</hydradb-context>"), "the wrapper is kept");
+    assert.equal(block, unified.llmPrompt, "safe server prompt is injected whole regardless of the split budget");
     assert.ok(!block.includes(secret), "secret redaction still applies");
 
     // With no llm_prompt the structured fallback is injected, bounded the same way.
     const fallback = buildHydraContextBlock({
       query: "q",
-      unified: { ...unified, llmPrompt: "" },
+      unified: { ...unified, llmPrompt: undefined },
       memory: empty,
       knowledge: empty,
       errors: [],
@@ -755,6 +755,7 @@ export async function runHttpTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases"
           ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
@@ -763,7 +764,7 @@ export async function runHttpTests() {
                 success: true,
                 message: "queued",
                 // Staging names the context `id` (V2MemoryResultItem).
-                results: [{ id: "m1", title: "Prefs", status: "queued", infer: true, error: null, error_code: null }],
+                results: [{ id: JSON.parse(req.bodyString).context[0].context_id, title: "Prefs", status: "queued", infer: true, error: null, error_code: null }],
                 success_count: 1,
                 failed_count: 0
               },
@@ -778,7 +779,7 @@ export async function runHttpTests() {
       customInstructions: "focus",
       sourceId: "m1"
     });
-    assert.equal(sink[0].path, "/databases", "the layout is probed once, first");
+    assert.equal(sink[0].path, "/context/ingest", "explicit layout dispatches directly without a probe");
     const req = sink.at(-1);
     assert.equal(req.path, "/context/ingest");
     assert.equal(req.httpMethod, "POST");
@@ -828,7 +829,7 @@ export async function runHttpTests() {
       ],
       upsert: true
     });
-    assert.equal(sink.filter((entry) => entry.path === "/databases").length, 1, "the layout is cached for the process");
+    assert.equal(sink.filter((entry) => entry.path === "/databases").length, 0, "explicit layout needs no database probes");
   }
 
   // 12b) The 202 parser: a failed item is reported by context id with its
@@ -887,6 +888,7 @@ export async function runHttpTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases"
           ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
@@ -965,10 +967,10 @@ export async function runHttpTests() {
         return { data: { success_count: 1, failed_count: 0 }, success: true };
       })
     });
-    await client.addMemories([{ text: "note" }]);
-    assert.equal(sink.at(-1).contentType, "application/json", "retried as the unified context[] body");
-    assert.deepEqual(JSON.parse(sink.at(-1).bodyString).context, [{ text: "note", enrich: true }]);
-    assert.equal(await client.isUnified(), true, "the refusal pins the layout for later calls");
+    await assert.rejects(() => client.addMemories([{ text: "note" }]), /400/);
+    assert.equal(sink.at(-1).contentType, "multipart/form-data", "failed split write retains its chosen format");
+    assert.equal(sink.length, 1, "one dispatch and no probe or retry");
+    assert.equal(await client.isUnified(), false, "failure cannot change the explicit default split layout");
   }
 
   // 13b) The SAME recovery for the knowledge lane. uploadKnowledge was the one
@@ -991,15 +993,13 @@ export async function runHttpTests() {
         return { data: { success_count: 1, failed_count: 0 }, success: true };
       })
     });
-    await client.uploadKnowledge([
+    await assert.rejects(() => client.uploadKnowledge([
       { id: "claude-file:a", title: "CLAUDE.md", content: { text: "# Smoke" } }
-    ]);
+    ]), /400/);
     const req = sink.at(-1);
-    assert.equal(req.contentType, "application/json", "knowledge retries as the unified context[] body too");
-    assert.deepEqual(JSON.parse(req.bodyString).context, [
-      { text: "# Smoke", enrich: true, context_id: "claude-file:a", title: "CLAUDE.md" }
-    ]);
-    assert.equal(await client.isUnified(), true, "the knowledge refusal pins the layout too");
+    assert.equal(req.contentType, "multipart/form-data", "knowledge keeps its explicit split format");
+    assert.equal(sink.length, 1, "one knowledge dispatch and no probe or retry");
+    assert.equal(await client.isUnified(), false, "a knowledge refusal cannot change layout");
   }
 
   // 13c) The ingest-body wording of the same refusal ("this database is
@@ -1034,9 +1034,10 @@ export async function runHttpTests() {
     });
     await assert.rejects(
       () => client.addMemories([{ text: "note" }]),
-      /503/,
-      "a retry that fails for an unrelated reason propagates that failure"
+      /400/,
+      "the original refusal propagates without a second dispatch"
     );
+    assert.equal(ingests, 1, "no cross-layout retry or probe");
     assert.equal(
       await client.isUnified(),
       false,
@@ -1051,19 +1052,19 @@ export async function runHttpTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases"
           ? { data: { databases: ["db_test"], details: [{ database: "db_test", type: "unified" }] }, success: true }
           : { data: { success_count: 1, failed_count: 0 }, success: true }
       )
     });
-    await client.uploadKnowledge([
+    await assert.rejects(() => client.uploadKnowledge([
       { id: "claude-file:empty", title: "EMPTY.md", content: { text: "   " } },
       { id: "claude-file:real", title: "CLAUDE.md", content: { text: "# Smoke" } }
-    ]);
-    const items = JSON.parse(sink.at(-1).bodyString).context;
-    assert.equal(items.length, 1, "the empty record is skipped, not sent");
-    assert.equal(items[0].context_id, "claude-file:real");
+    ]), /text XOR conversation/);
+    assert.equal(sink.length, 0, "invalid content is rejected before dispatch");
+
   }
 
   // 13e) The workspace-sync knowledge record keeps everything its producer set.
@@ -1088,13 +1089,13 @@ export async function runHttpTests() {
       enrich: true,
       context_id: "claude-file:abc",
       title: "CLAUDE.md",
-      happened_at: "2026-09-05",
       attributes: { workspace: "t", relative_path: "CLAUDE.md", extension: ".md" },
       custom_attributes: {
         size_bytes: 7,
         plugin: "hydradb",
         source: "claude-code-plugin",
-        description: "Workspace context synced from t",
+        original_description: "Workspace context synced from t",
+        original_timestamp: "2026-09-05T10:00:00.000Z",
         url: "hydradb://workspace/t/CLAUDE.md"
       }
     });
@@ -1265,7 +1266,7 @@ export async function runHttpTests() {
   {
     const sink = [];
     const wrapper = createHydraWrapper({
-      apiKey: "k",
+      apiKey: "synthetic-claude-contract-key",
       tenantId: "db_test",
       subTenantId: "col_test",
       baseUrl: "https://api.hydradb.test",
@@ -1418,7 +1419,7 @@ export async function runGoldenTests(root) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-golden-"));
   await fs.writeFile(
     path.join(dataDir, "config.json"),
-    JSON.stringify({ apiKey: "k", tenantId: "db_test", subTenantId: "" }),
+    JSON.stringify({ apiKey: "synthetic-claude-contract-key", tenantId: "db_test", subTenantId: "" }),
     "utf8"
   );
   const doctorRaw = execFileSync(

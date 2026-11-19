@@ -46,6 +46,7 @@ export const DEFAULTS = {
   autoIngest: true,
   captureMode: "session-upsert",
   searchMode: "memory",
+  layout: "split",
   ingestionMode: "memory",
   recallMode: "fast",
   graphContext: true,
@@ -76,6 +77,7 @@ const KNOWN_KEYS = new Set([
   "autoIngest",
   "captureMode",
   "searchMode",
+  "layout",
   "ingestionMode",
   "recallMode",
   "graphContext",
@@ -357,6 +359,7 @@ export async function loadConfig(cwd, dataDir) {
     userName: envOrUndefined("HYDRADB_USER_NAME"),
     captureMode: envOrUndefined("HYDRADB_CAPTURE_MODE"),
     searchMode: envOrUndefined("HYDRADB_SEARCH_MODE"),
+    layout: envOrUndefined("HYDRADB_LAYOUT"),
     ingestionMode: envOrUndefined("HYDRADB_INGESTION_MODE"),
     recallMode: envOrUndefined("HYDRADB_RECALL_MODE"),
     ignoreMarker: envOrUndefined("HYDRADB_IGNORE_MARKER"),
@@ -404,6 +407,7 @@ export async function loadConfig(cwd, dataDir) {
   const hasExplicitSubTenantId = typeof merged.subTenantId === "string";
 
   const config = {
+    layout: parseMode(merged.layout, DEFAULTS.layout, errors, "layout", ["split", "unified"]),
     apiBaseUrl:
       typeof merged.apiBaseUrl === "string" && merged.apiBaseUrl
         ? merged.apiBaseUrl.replace(/\/+$/g, "")
@@ -561,7 +565,7 @@ export async function loadConfig(cwd, dataDir) {
   }
 
   return {
-    configured: Boolean(config.apiKey && config.tenantId && hasExplicitSubTenantId),
+    configured: Boolean(config.apiKey && config.tenantId && hasExplicitSubTenantId && ["split", "unified"].includes(merged.layout ?? DEFAULTS.layout)),
     config,
     projectRoot,
     workspaceName,
@@ -586,6 +590,7 @@ export function formatStatus(configResult, state) {
     configSources: sources,
     errors,
     resolvedConfig: {
+      ...(config.layout === "unified" ? { layout: config.layout } : {}),
       apiBaseUrl: config.apiBaseUrl,
       tenantId: config.tenantId || "",
       subTenantId: config.subTenantId,
