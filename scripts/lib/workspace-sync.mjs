@@ -468,6 +468,14 @@ export async function syncWorkspace({
       });
     } catch (error) {
       summary.errors.push(`memory ingest failed: ${error.message}`);
+      if (unified && error.ingest?.contextIds?.length) {
+        try {
+          const rollback = await client.deleteMemories(error.ingest.contextIds, { timeoutMs: config.writeTimeoutMs });
+          if (rollback.failedIds?.length) summary.errors.push(`memory rollback incomplete: ${rollback.failedIds.join(", ")}`);
+        } catch (rollbackError) {
+          summary.errors.push(`memory rollback failed: ${rollbackError.message}`);
+        }
+      }
       for (const item of batch) {
         failedPaths.add(fileOfSourceId.get(item.source_id));
       }
@@ -481,6 +489,14 @@ export async function syncWorkspace({
       await client.uploadKnowledge(batch);
     } catch (error) {
       summary.errors.push(`knowledge ingest failed: ${error.message}`);
+      if (unified && error.ingest?.contextIds?.length) {
+        try {
+          const rollback = await client.deleteKnowledge(error.ingest.contextIds, { timeoutMs: config.writeTimeoutMs });
+          if (rollback.failedIds?.length) summary.errors.push(`knowledge rollback incomplete: ${rollback.failedIds.join(", ")}`);
+        } catch (rollbackError) {
+          summary.errors.push(`knowledge rollback failed: ${rollbackError.message}`);
+        }
+      }
       for (const file of files) {
         failedPaths.add(file.filePath);
       }

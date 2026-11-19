@@ -416,6 +416,7 @@ const conformanceResult = await runConformance();
 const httpResult = await runHttpTests();
 const goldenResult = await runGoldenTests(root);
 const unifiedFixResult = await runUnifiedFixTests();
+execFileSync(process.execPath, ["--test", path.join(root, "tests/unified-rollout.test.mjs")], { stdio: "inherit" });
 
 process.stdout.write(
   `Validated ${scriptFiles.length} core scripts, ${jsonFiles.length} JSON files, recall normalization, ` +

@@ -11,6 +11,8 @@
 // budgets, and send API-Version: 2 (the SDK does this).
 
 import { HydraDBClient, HydraDBError, HydraDBTimeoutError } from "../../vendor/hydradb-sdk.mjs";
+import { redactSecrets, registerSecret } from "../sanitize.mjs";
+import { unifiedBatches, validateLayout } from "../unified.mjs";
 
 const DEFAULT_API_BASE = "https://api.hydradb.com";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -74,14 +76,14 @@ function translateError(error, label, timeoutMs) {
   if (error instanceof HydraDBError) {
     const status = error.statusCode != null ? ` with ${error.statusCode}` : "";
     const body = coerceBody(error.body);
-    return new HydraWrapperError(`${label} failed${status}${body ? `: ${body}` : ""}`, {
+    return new HydraWrapperError(redactSecrets(`${label} failed${status}${body ? `: ${body}` : ""}`), {
       status: error.statusCode,
       body: error.body,
       errorCode: extractErrorCode(error.body)
     });
   }
   const message = error instanceof Error ? error.message : String(error);
-  return new HydraWrapperError(`${label} failed: ${message}`);
+  return new HydraWrapperError(redactSecrets(`${label} failed: ${message}`));
 }
 
 // The SDK deserializes the v2 wire response into camelCase (deletedCount,
@@ -116,6 +118,13 @@ function unwrapAndNormalize(value) {
     value && typeof value === "object" && "data" in value && ("success" in value || "meta" in value)
       ? value.data
       : value;
+  if (data && Array.isArray(data.graph) && typeof data.llm_prompt === "string") {
+    return { ...data, chunks: (data.chunks ?? []).map(chunk => {
+      if (!chunk || !("chunkMetadata" in chunk)) return chunk;
+      const { chunkMetadata, ...rest } = chunk;
+      return { ...rest, chunk_metadata: chunkMetadata };
+    }) };
+  }
   return snakeCaseKeys(data);
 }
 
@@ -200,10 +209,13 @@ export function createHydraWrapper({
   baseUrl = DEFAULT_API_BASE,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   writeTimeoutMs = DEFAULT_WRITE_TIMEOUT_MS,
+  layout = "split",
   // Injectable for conformance/HTTP tests; production builds the real client.
   sdkClient,
   fetch: fetchImpl
 } = {}) {
+  validateLayout(layout);
+  registerSecret(apiKey);
   const database = tenantId || "";
   const collection = subTenantId ?? "";
 
@@ -225,57 +237,41 @@ export function createHydraWrapper({
     }
   }
 
-  // PRO-1618: the vendored SDK predates the unified `context[]` ingest body,
-  // `type` on database create and `details[]` on the database list, and it
-  // drops fields it does not know. Those calls go over the wire by hand,
-  // through the same envelope unwrap and error translation, until the SDK is
-  // regenerated.
-  const rawFetch = fetchImpl ?? globalThis.fetch;
-  const rawBase = baseUrl.replace(/\/+$/g, "");
-  async function rawJson(label, method, path, body, timeoutMs) {
-    let response;
-    try {
-      response = await rawFetch(`${rawBase}${path}`, {
-        method,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          // CONTRACT S2 rule 6: every v2 call names its version.
-          "API-Version": "2"
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs)
-      });
-    } catch (error) {
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw new HydraWrapperError(`${label} timed out after ${timeoutMs}ms`);
+  async function sdkJson(label, method, route, body, timeoutMs) {
+    const routePath = route.split("?")[0];
+    if (routePath === "/context/ingest") unifiedBatches(body.context);
+    const serialized = body === undefined ? undefined : JSON.stringify(body);
+    if (serialized != null && Buffer.byteLength(serialized) > 16 * 1024 * 1024) throw new HydraWrapperError("unified body exceeds 16 MiB; split the request");
+    const transport = fetchImpl ?? globalThis.fetch;
+    const bridge = new HydraDBClient({
+      token: apiKey, baseUrl: baseUrl.replace(/\/+$/g, ""), maxRetries: MAX_RETRIES,
+      fetch: (url, init) => {
+        if (!new URL(url).pathname.endsWith(routePath) || init?.method !== method) throw new Error("Unexpected SDK request for unified bridge");
+        if (serialized == null) return transport(url, init);
+        const headers = new Headers(init.headers);
+        headers.delete("content-type");
+        headers.delete("content-length");
+        headers.set("Content-Type", "application/json");
+        return transport(url, { ...init, headers, body: serialized });
       }
-      throw translateError(error, label, timeoutMs);
-    }
-    const text = await response.text().catch(() => "");
-    let parsed = null;
-    try {
-      parsed = text ? JSON.parse(text) : null;
-    } catch {
-      parsed = text;
-    }
-    if (!response.ok) {
-      throw new HydraWrapperError(`${label} failed with ${response.status}${text ? `: ${text}` : ""}`, {
-        status: response.status,
-        body: parsed,
-        errorCode: extractErrorCode(parsed)
-      });
-    }
-    return parsed;
+    });
+    const scope = contextScope();
+    const options = requestOptions(timeoutMs);
+    return call(label, timeoutMs, () => {
+      if (routePath === "/query") return bridge.query({ ...scope, query: body.query }, options);
+      if (routePath === "/context/ingest") return bridge.context.ingest(scope, options);
+      if (routePath === "/context/list") return bridge.context.list(scope, options);
+      if (routePath === "/context") return bridge.context.delete({ ...scope, ids: body.ids }, options);
+      if (routePath === "/databases" && method === "POST") return bridge.databases.create({ database: body.database }, options);
+      if (routePath === "/databases" && method === "GET") return bridge.databases.list(options);
+      if (routePath === "/context/relations") {
+        const params = new URLSearchParams(route.split("?")[1]);
+        return bridge.context.relations({ ...scope, id: params.get("id") ?? undefined }, options);
+      }
+      throw new HydraWrapperError("Unsupported unified SDK bridge route");
+    });
   }
-  // `kind: "unified"` is the plugin's INTERNAL selector for the unified
-  // database layout. It never reaches the wire: the contract says a unified
-  // database is sent no `type` at all (absent is its default; knowledge and
-  // memory are refused). Every call that carries it is built by hand because
-  // the generated client's serializers would either reject the value or add a
-  // split-era field. The wire is already snake_case, which is the shape the
-  // plugin normalises everything to anyway.
-  const unifiedKind = (args) => args.kind === "unified";
+  const unifiedKind = (args) => layout === "unified" || args.kind === "unified";
 
   function requestOptions(timeoutMs) {
     return { timeoutInSeconds: Math.max(1, Math.ceil(timeoutMs / 1000)), maxRetries: MAX_RETRIES };
@@ -308,8 +304,7 @@ export function createHydraWrapper({
         // CONTRACT (POST /query on a unified database): the v2 request fields
         // and NO `type`; follow_forceful_relations selects the
         // forceful_relations[] bucket of the four-key response.
-        return unwrapAndNormalize(
-          await rawJson("/query", "POST", "/query", {
+        const envelope = await sdkJson("/query", "POST", "/query", {
             ...contextScope(),
             query: args.query,
             ...(args.operator ? { operator: args.operator } : {}),
@@ -321,8 +316,9 @@ export function createHydraWrapper({
             ...(args.followForcefulRelations != null
               ? { follow_forceful_relations: Boolean(args.followForcefulRelations) }
               : {})
-          }, timeoutMs)
-        );
+          }, timeoutMs);
+        const data = unwrapAndNormalize(envelope);
+        return envelope?.meta?.warnings != null ? { ...data, warnings: data.warnings ?? envelope.meta.warnings } : data;
       }
       const request = {
         ...contextScope(),
@@ -343,14 +339,12 @@ export function createHydraWrapper({
     async ingest(args = {}, opts = {}) {
       const timeoutMs = opts.timeoutMs ?? writeTimeoutMs;
       if (args.context != null) {
-        // The unified JSON body (CONTRACT: POST /context/ingest on a unified
-        // database). The list key is `context` (the server also accepts the
-        // `items` and `contexts` aliases; the contract says send `context`),
-        // each entry is text or a conversation, there is no corpus selector,
-        // and enrich/upsert/instructions are the request-level defaults for
-        // the items.
+        for (const key of ["upsert", "enrich"]) {
+          if (args[key] != null && typeof args[key] !== "boolean") throw new HydraWrapperError(`${key} must be boolean`);
+        }
+        if (args.instructions != null && (typeof args.instructions !== "string" || [...args.instructions.trim()].length > 4000)) throw new HydraWrapperError("instructions must be a string of at most 4000 characters");
         return unwrapAndNormalize(
-          await rawJson("/context/ingest", "POST", "/context/ingest", {
+          await sdkJson("/context/ingest", "POST", "/context/ingest", {
             ...contextScope(),
             context: args.context,
             ...(args.upsert != null ? { upsert: Boolean(args.upsert) } : {}),
@@ -386,7 +380,7 @@ export function createHydraWrapper({
       if (unifiedKind(args)) {
         // CONTRACT: unchanged shape, and no `type` on a unified database.
         return unwrapAndNormalize(
-          await rawJson("/context/list", "POST", "/context/list", { ...contextScope() }, timeoutMs)
+          await sdkJson("/context/list", "POST", "/context/list", { ...contextScope() }, timeoutMs)
         );
       }
       const request = { ...contextScope(), ...(args.kind ? { type: args.kind } : {}) };
@@ -418,7 +412,7 @@ export function createHydraWrapper({
         // CONTRACT: unchanged shape, and no `type` on a unified database.
         const params = new URLSearchParams({ ...contextScope(), ...(args.id ? { id: args.id } : {}) });
         return unwrapAndNormalize(
-          await rawJson("/context/relations", "GET", `/context/relations?${params.toString()}`, undefined, timeoutMs)
+          await sdkJson("/context/relations", "GET", `/context/relations?${params.toString()}`, undefined, timeoutMs)
         );
       }
       const request = { ...contextScope(), ...(args.id ? { id: args.id } : {}) };
@@ -446,7 +440,7 @@ export function createHydraWrapper({
         ...(args.kind && !unified ? { type: args.kind } : {})
       };
       const envelope = unified
-        ? await rawJson("/context (delete)", "DELETE", "/context", request, timeoutMs)
+        ? await sdkJson("/context (delete)", "DELETE", "/context", request, timeoutMs)
         : await call("/context (delete)", timeoutMs, () => client.context.delete(request, requestOptions(timeoutMs)));
       const data = unwrapAndNormalize(envelope) ?? {};
       const { deletedIds, failedIds } = classifyDeletion(requestedIds, envelope, data);
@@ -463,7 +457,7 @@ export function createHydraWrapper({
         // `type` (split|unified) is dropped by the vendored SDK's serializer,
         // which would provision a split database in silence.
         return unwrapAndNormalize(
-          await rawJson("/databases (create)", "POST", "/databases", {
+          await sdkJson("/databases (create)", "POST", "/databases", {
             database: args.database,
             type: args.type,
             ...(args.extra || {})
@@ -494,7 +488,7 @@ export function createHydraWrapper({
     async layouts(opts = {}) {
       if (!layoutsPromise) {
         const timeoutMs = opts.timeoutMs ?? requestTimeoutMs;
-        layoutsPromise = rawJson("/databases", "GET", "/databases", undefined, timeoutMs)
+        layoutsPromise = sdkJson("/databases", "GET", "/databases", undefined, timeoutMs)
           .then((envelope) => unwrapAndNormalize(envelope))
           .then((listed) => {
             const map = new Map();

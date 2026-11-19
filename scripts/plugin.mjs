@@ -8,10 +8,8 @@ import process from "node:process";
 
 import { formatStatus, loadConfig, PROJECT_CONFIG_FILES } from "./lib/config.mjs";
 import {
-  boundUnifiedRecall,
   buildHydraContextBlock,
   buildUnifiedStructuredString,
-  fitRecallPayload,
   QUERY_OUTPUT_CHARS
 } from "./lib/context-format.mjs";
 import {
@@ -171,8 +169,7 @@ async function getRuntime() {
         subTenantId: configResult.config.subTenantId,
         requestTimeoutMs: configResult.config.requestTimeoutMs,
         writeTimeoutMs: configResult.config.writeTimeoutMs,
-        layoutCacheFile: dataDir ? path.join(dataDir, "layout-cache.json") : undefined,
-        onDebug: (event, payload) => appendDebugLog(dataDir, configResult.config.debug, event, payload)
+        layout: configResult.config.layout,
       })
     : null;
 
@@ -309,10 +306,6 @@ async function performRecall(client, config, query) {
 
   const settled = await Promise.allSettled(tasks);
 
-  // The layout probe can fail and read as split; the server then refuses the
-  // split kind and the client retries once as unified, so a split-mode call
-  // can legitimately come back with the four-key body. It is reported as the
-  // unified result it is, not pushed through the MEMORY/KNOWLEDGE template.
   const answeredUnified = settled.find(
     (entry) => entry.status === "fulfilled" && entry.value?.layout === "unified"
   );
@@ -962,6 +955,7 @@ async function handleSaveSession(args) {
 }
 
 function renderRecallText(result) {
+  if (result.unified?.llmPrompt != null) return result.unified.llmPrompt;
   const lines = [];
 
   if (result.searchMode === "unified") {
@@ -1024,11 +1018,10 @@ async function handleRecall(args, commandName = "recall") {
   }
 
   const recall = await performRecall(runtime.client, runtime.configResult.config, query);
-  const payload = fitRecallPayload({
+  const payload = {
     query,
-    ...recall,
-    ...(recall.unified ? { unified: boundUnifiedRecall(recall.unified) } : {})
-  });
+    ...recall
+  };
 
   if (jsonMode) {
     emitJson(payload);

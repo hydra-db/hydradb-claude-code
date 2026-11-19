@@ -61,6 +61,7 @@ export async function runUnifiedFixTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases" ? unifiedProbe : ingest202(JSON.parse(req.bodyString).context)
       )
@@ -82,6 +83,7 @@ export async function runUnifiedFixTests() {
   {
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch([], (req) =>
         req.path === "/databases" ? unifiedProbe : ingest202([{ context_id: "note-1" }])
       )
@@ -99,6 +101,7 @@ export async function runUnifiedFixTests() {
     const respond = (data) =>
       new HydraClient({
         ...SCOPE,
+      layout: "unified",
         fetch: capturingFetch([], (req) => (req.path === "/databases" ? unifiedProbe : { data, success: true, meta: UNIFIED_QUERY_META }))
       });
 
@@ -147,7 +150,7 @@ export async function runUnifiedFixTests() {
 
     const empty = { chunks: [], queryPaths: [], graphContext: {}, additionalContext: {} };
     const block = buildHydraContextBlock({ query: "q", unified: recall, memory: empty, knowledge: empty, errors: [], maxContextChars: 7000 });
-    assert.ok(block.length <= 7000, `the hook block stays within maxContextChars (${block.length})`);
+    assert.equal(block, prompt, "safe server prompt is injected whole; the split budget does not rewrite it");
     tests += 1;
   }
 
@@ -163,6 +166,7 @@ export async function runUnifiedFixTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) =>
         req.path === "/databases" ? unifiedProbe : ingest202(JSON.parse(req.bodyString).context)
       )
@@ -181,43 +185,24 @@ export async function runUnifiedFixTests() {
     tests += 1;
   }
 
-  // 6) The layout: cached on disk across processes, probed with a short
-  //    timeout, a failed probe logged and read as "unknown", and a KNOWN split
-  //    database never retried as unified.
   {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-layout-"));
     const cacheFile = path.join(dir, "layout-cache.json");
-    const sink = [];
-    const make = () => new HydraClient({ ...SCOPE, layoutCacheFile: cacheFile, fetch: capturingFetch(sink, () => unifiedProbe) });
-    assert.equal(await make().isUnified(), true);
-    assert.equal(await make().isUnified(), true, "a second hook process reads the cache");
-    assert.equal(sink.filter((r) => r.path === "/databases").length, 1, "one probe for both processes");
-
-    const events = [];
-    const failing = new HydraClient({
-      ...SCOPE,
-      onDebug: (event, payload) => events.push({ event, payload }),
-      fetch: capturingFetch([], () => ({ __status: 500, success: false, error: { message: "boom" } }))
-    });
-    assert.equal(await failing.layoutState(), "unknown");
-    assert.equal(events[0]?.event, "layout-probe", "a failed probe is logged, not swallowed");
-
-    const refusal = {
-      __status: 400,
-      success: false,
-      error: { code: "CORPUS_TYPE_UNSUPPORTED", message: 'type "memory" is not valid on a unified database' }
-    };
+    await fs.writeFile(cacheFile, JSON.stringify({ stale: { layout: "unified" } }));
+    for (const layout of ["split", "unified"]) {
+      const sink = [];
+      const client = new HydraClient({ ...SCOPE, layout, layoutCacheFile: cacheFile, fetch: capturingFetch(sink, () => unifiedProbe) });
+      assert.equal(await client.layoutState(), layout);
+      assert.equal(await client.isUnified(), layout === "unified");
+      assert.equal(await client.resolveLayoutPatiently(), layout);
+      assert.equal(sink.length, 0, "explicit choice never reads the network or stale layout cache");
+    }
     const splitSink = [];
-    const knownSplit = new HydraClient({
-      ...SCOPE,
-      fetch: capturingFetch(splitSink, (req) => (req.path === "/databases" ? splitProbe : refusal))
-    });
-    await assert.rejects(() => knownSplit.addMemories([{ text: "a", source_id: "a" }]));
-    assert.equal(
-      splitSink.filter((r) => r.path === "/context/ingest").length,
-      1,
-      "a known split database is not retried as unified"
-    );
+    const knownSplit = new HydraClient({ ...SCOPE, layout: "split", fetch: capturingFetch(splitSink, () => ({
+      __status: 400, success: false, error: { code: "CORPUS_TYPE_UNSUPPORTED", message: 'type "memory" is not valid on a unified database' }
+    })) });
+    await assert.rejects(() => knownSplit.addMemories([{ text: "a", source_id: "a" }]), /400/);
+    assert.equal(splitSink.length, 1, "one split dispatch without a probe or cross-layout retry");
     tests += 1;
   }
 
@@ -232,6 +217,7 @@ export async function runUnifiedFixTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) => (req.path === "/databases" ? unifiedProbe : ingest202(JSON.parse(req.bodyString).context)))
     });
     const state = { files: {}, sessions: {}, lastSessionId: "", lastRecall: null };
@@ -301,6 +287,7 @@ export async function runUnifiedFixTests() {
     const sink = [];
     const client = new HydraClient({
       ...SCOPE,
+      layout: "unified",
       fetch: capturingFetch(sink, (req) => {
         if (req.path === "/databases") {
           probes += 1;
@@ -321,22 +308,23 @@ export async function runUnifiedFixTests() {
       workspaceName: "t",
       state
     });
-    assert.equal(probes, 2, "the probe was retried patiently");
+    assert.equal(probes, 0, "explicit unified layout sizes chunks without probing");
     const items = sink.filter((r) => r.path === "/context/ingest").flatMap((r) => JSON.parse(r.bodyString).context);
     assert.ok(items.length >= 3 && items.every((i) => i.text.length <= UNIFIED_MAX_CHUNK_CHARS), "unified-sized pieces");
     tests += 1;
   }
 
-  // 10) Greptile on #14: concurrent layout-cache writes never leave a torn
-  //     file behind (temp file + rename).
   {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-cache-race-"));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hydradb-explicit-race-"));
     const cacheFile = path.join(dir, "layout-cache.json");
-    const clients = Array.from({ length: 20 }, (_, i) =>
-      new HydraClient({ ...SCOPE, tenantId: `db_${i}`, layoutCacheFile: cacheFile, fetch: capturingFetch([], () => unifiedProbe) }));
-    await Promise.all(clients.map((c) => c._writeLayoutCache("unified")));
-    JSON.parse(await fs.readFile(cacheFile, "utf8"));
-    assert.deepEqual((await fs.readdir(dir)).filter((f) => f.endsWith(".tmp")), [], "no temp files left");
+    const sink = [];
+    const clients = Array.from({ length: 20 }, (_, i) => new HydraClient({
+      ...SCOPE, tenantId: `db_${i}`, layout: i % 2 ? "unified" : "split", layoutCacheFile: cacheFile,
+      fetch: capturingFetch(sink, () => unifiedProbe)
+    }));
+    assert.deepEqual(await Promise.all(clients.map(client => client.layoutState())), clients.map((_, i) => i % 2 ? "unified" : "split"));
+    assert.equal(sink.length, 0, "concurrent explicit choices need no probes or shared cache");
+    await assert.rejects(() => fs.stat(cacheFile), { code: "ENOENT" });
     tests += 1;
   }
 

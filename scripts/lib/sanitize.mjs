@@ -24,6 +24,12 @@ const SECRET_PATTERNS = [
   }
 ];
 
+const registeredSecrets = new Set();
+
+export function registerSecret(value) {
+  if (typeof value === "string" && value.trim()) registeredSecrets.add(value.trim());
+}
+
 export function normalizeText(text) {
   return String(text || "").replace(/\r\n/g, "\n");
 }
@@ -37,8 +43,9 @@ export function truncateText(text, maxLength) {
   return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
-export function redactSecrets(text) {
-  let redacted = normalizeText(text);
+export function redactSecrets(text, { preserveFormatting = false } = {}) {
+  let redacted = preserveFormatting ? String(text ?? "") : normalizeText(text);
+  for (const secret of registeredSecrets) redacted = redacted.split(secret).join("[REDACTED:credential]");
 
   for (const { label, regex } of SECRET_PATTERNS) {
     redacted = redacted.replace(regex, `[REDACTED:${label}]`);

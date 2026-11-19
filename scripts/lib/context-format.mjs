@@ -411,6 +411,8 @@ export function buildUnifiedContextString(result, maxChars) {
 }
 
 export function buildHydraContextBlock({ query, unified, memory, knowledge, errors, maxContextChars }) {
+  const unifiedResult = unified ?? (memory?.layout === "unified" ? memory : knowledge?.layout === "unified" ? knowledge : null);
+  if (unifiedResult && typeof unifiedResult.llmPrompt === "string") return unifiedResult.llmPrompt;
   const sections = [];
 
   // PRO-1618: a unified database answers with the four-key body; the section
