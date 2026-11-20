@@ -9,7 +9,7 @@ This guide covers the day-to-day setup and operating modes for the HydraDB Claud
 After the repo is public, install it in Claude Code with:
 
 ```text
-/plugin marketplace add usecortex/hydradb-claude-code
+/plugin marketplace add hydra-db/hydradb-claude-code
 /plugin install hydradb@hydradb
 ```
 
