@@ -144,15 +144,15 @@ function isCredentialKey(key) {
 }
 
 // Preserve structured response extensions without bypassing secret redaction.
-function redactStructured(value) {
-  if (typeof value === "string") return redactSecrets(value);
-  if (Array.isArray(value)) return value.map(redactStructured);
+function redactStructured(value, apiKey) {
+  if (typeof value === "string") return redactSecrets(typeof apiKey === "string" && apiKey.length ? value.split(apiKey).join("[REDACTED:credential]") : value);
+  if (Array.isArray(value)) return value.map(entry => redactStructured(entry, apiKey));
   if (value && typeof value === "object") return Object.fromEntries(
     Object.entries(value).map(([key, entry]) => [
       key,
       isCredentialKey(key)
         ? "[REDACTED]"
-        : redactStructured(entry)
+        : redactStructured(entry, apiKey)
     ])
   );
   return value;
@@ -362,7 +362,7 @@ function extractDetailedQueryPaths(response) {
 // (scripts/lib/hydra/), which unwraps and snake_cases every SDK response, and
 // the check/golden fixtures are authored snake_case. The polymorphic normalizer
 // is otherwise kept verbatim — it still tolerates the many v1 field spellings.
-export function normalizeRetrievalResponse(response) {
+export function normalizeRetrievalResponse(response, apiKey) {
   const rawChunks = response?.chunks || response?.results || response?.context || [];
   const chunks = Array.isArray(rawChunks)
     ? rawChunks
@@ -402,6 +402,8 @@ export function normalizeRetrievalResponse(response) {
 
   return {
     chunks,
+    ...(response?.graph != null ? { graph: redactStructured(response.graph, apiKey) } : {}),
+    ...(response?.forceful_relations != null ? { forcefulRelations: redactStructured(response.forceful_relations, apiKey) } : {}),
     ...(response?.tabular_data != null ? { tabularData: redactStructured(response.tabular_data) } : {}),
     ...(response?.temporal_facts != null ? { temporalFacts: redactStructured(response.temporal_facts) } : {}),
     ...(response?.warnings != null ? { warnings: redactStructured(response.warnings) } : {}),
@@ -417,6 +419,7 @@ export function normalizeRetrievalResponse(response) {
 }
 
 export class HydraClient {
+  #apiKey;
   constructor({
     apiKey,
     tenantId,
@@ -429,6 +432,7 @@ export class HydraClient {
     fetch: fetchImpl,
     sdkClient
   } = {}) {
+    this.#apiKey = apiKey;
     // Kept as public fields: plugin code duck-types tenantId/subTenantId
     // (workspace-sync.mjs) and other call sites read them directly.
     this.tenantId = tenantId;
@@ -463,7 +467,8 @@ export class HydraClient {
           tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
-      )
+      ),
+      this.#apiKey
     );
   }
 
@@ -482,7 +487,8 @@ export class HydraClient {
           tableLimit: options.tableLimit ?? options.table_limit
         },
         { timeoutMs: options.timeoutMs ?? this.requestTimeoutMs }
-      )
+      ),
+      this.#apiKey
     );
   }
 

@@ -75,7 +75,7 @@ export function snakeCaseKeys(value, isTabular = false) {
         key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase(),
         // Metadata is an opaque user map, not an SDK model; its keys can
         // differ only by casing and must not be normalized recursively.
-        key === "chunkMetadata" || key === "chunk_metadata" || (isTabular && key === "records")
+        ["chunkMetadata", "chunk_metadata", "metadata", "additionalMetadata", "additional_metadata", "properties"].includes(key) || (isTabular && key === "records")
           ? entry
           : snakeCaseKeys(entry, key === "tabularData" || key === "tabular_data")
       ])

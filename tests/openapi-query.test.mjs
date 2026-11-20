@@ -4,6 +4,68 @@ import { buildHydraContextBlock } from "../scripts/lib/context-format.mjs";
 import { createHydraWrapper } from "../scripts/lib/hydra/index.mjs";
 import { HydraClient, normalizeRetrievalResponse } from "../scripts/lib/hydra-client.mjs";
 
+test("real SDK split recall retains graph and declared relation provenance with redacted opaque metadata", async () => {
+  const credential = "production-retention-test-credential";
+  const graph = { paths: [{ chunk_ids: ["chunk-1"], combined_context: `Graph evidence ${credential}`,
+    relevancy_score: 0.9, triplets: [{ source: { entity_id: "entity-1", name: "Ada" },
+      relation: { canonical_predicate: "works_at", context: "password=graph-password-value" },
+      target: { entity_id: "entity-2", name: "Acme" } }] }] };
+  const forcefulRelations = { declared: [{ via: { from: "source-1", to: "source-2" }, chunk: {
+    id: "source-2", chunk_uuid: "linked-chunk", chunk_content: `Linked evidence ${credential}`,
+    metadata: { customerID: "upper", customer_id: "lower", nestedMap: { keyID: "visible", access_token: "hidden-token" } },
+    additional_metadata: { referenceID: "ref", reference_id: "other", note: "password=metadata-password-value" }
+  } }], inferred: [] };
+  const legacy = { chunks: [{ id: "source-1", chunk_uuid: "chunk-1", chunk_content: "Existing chunk" }],
+    graph_context: { query_paths: [{ triplets: [{ source: { name: "Ada" }, relation: { canonical_predicate: "uses" }, target: { name: "HydraDB" } }] }],
+      chunk_relations: [], chunk_id_to_group_ids: {} },
+    additional_context: { linked: { source_title: "Existing source", chunk_content: "Existing linked context" } },
+    llm_prompt: "Existing split prompt" };
+  let calls = 0;
+  const client = new HydraClient({ apiKey: credential, tenantId: "database", subTenantId: "collection", fetch: async (url, init) => {
+    calls++;
+    assert.ok(String(url).endsWith("/query"));
+    const body = JSON.parse(init.body);
+    assert.equal(body.type, "knowledge");
+    assert.equal(body.database, "database");
+    assert.equal(body.collection, "collection");
+    assert.equal(new Headers(init.headers).get("API-Version"), "2");
+    return Response.json({ success: true, data: { ...legacy, graph, forceful_relations: forcefulRelations } });
+  } });
+  const result = await client.recallKnowledge("query");
+  assert.equal(calls, 1);
+  assert.deepEqual(result.graph.paths[0].chunk_ids, ["chunk-1"]);
+  assert.equal(result.graph.paths[0].relevancy_score, 0.9);
+  assert.equal(result.graph.paths[0].triplets[0].source.entity_id, "entity-1");
+  assert.deepEqual(result.forcefulRelations.declared[0].via, { from: "source-1", to: "source-2" });
+  assert.deepEqual(result.forcefulRelations.inferred, []);
+  const chunk = result.forcefulRelations.declared[0].chunk;
+  assert.equal(chunk.id, "source-2");
+  assert.equal(chunk.chunk_uuid, "linked-chunk");
+  assert.deepEqual(chunk.metadata, { customerID: "upper", customer_id: "lower", nestedMap: { keyID: "visible", access_token: "[REDACTED]" } });
+  assert.equal(chunk.additional_metadata.referenceID, "ref");
+  assert.equal(chunk.additional_metadata.reference_id, "other");
+  for (const secret of [credential, "graph-password-value", "hidden-token", "metadata-password-value"]) assert.ok(!JSON.stringify(result).includes(secret));
+  const { graph: retainedGraph, forcefulRelations: retainedRelations, ...legacyResult } = result;
+  const baseline = normalizeRetrievalResponse(legacy);
+  assert.deepEqual(legacyResult, baseline);
+  assert.equal(Object.hasOwn(baseline, "graph"), false);
+  assert.equal(Object.hasOwn(baseline, "forcefulRelations"), false);
+  assert.equal(buildHydraContextBlock({ query: "query", knowledge: result, maxContextChars: 7000 }),
+    buildHydraContextBlock({ query: "query", knowledge: baseline, maxContextChars: 7000 }));
+});
+
+test("real SDK relations preserves nested opaque properties without case collisions", async () => {
+  const properties = { customerID: 1, customer_id: 2, nestedMap: { externalID: "upper", external_id: "lower" },
+    list: [{ accountID: 3, account_id: 4 }], token_count: 120 };
+  const wrapper = createHydraWrapper({ apiKey: "properties-test-credential", tenantId: "database", fetch: async (url, init) => {
+    assert.ok(String(url).includes("/context/relations"));
+    assert.equal(init.method, "GET");
+    return Response.json({ success: true, data: { relations: [{ properties }] } });
+  } });
+  const result = await wrapper.context.relations({ id: "source-1" });
+  assert.deepEqual(result.relations[0].properties, properties);
+});
+
 test("query forwards additive options and preserves envelope warnings", async () => {
   let request;
   const wrapper = createHydraWrapper({ sdkClient: { query: async (args) => {
